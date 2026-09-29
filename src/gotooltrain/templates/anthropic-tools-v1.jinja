@@ -1,0 +1,117 @@
+{#-
+  format: anthropic-tools-v1
+  anthropic-tools-v1 — chat template for a Go-specialised tool-use model.
+
+  SINGLE SOURCE OF TRUTH for the token format. Training and inference must both
+  load it (it is shipped into tokenizer_config.json by
+  gotooltrain.install_template). Never re-implement this rendering in Python:
+  duplicated renderers drift silently, and the drift surfaces only as a quality
+  regression, never as an error.
+
+  Validation lives in gotooltrain.normalize, not here. This template renders;
+  it assumes the data layer already rejected malformed records.
+
+  Whitespace
+  ----------
+  transformers compiles chat templates with trim_blocks=True, which deletes the
+  newline that follows any block tag, and `{%- ... -%}` strips further. Mixing
+  the two silently glued `<|im_start|>system` to its body and ran the whole tool
+  catalogue onto one line. Every newline is therefore emitted explicitly as part
+  of the rendered string. Do not "simplify" this back to bare newlines in the
+  template body — tests/golden/anthropic-tools-v1.txt locks the exact bytes.
+
+  Conventions
+  -----------
+  * Turn framing reuses Qwen's native <|im_start|> / <|im_end|> so the
+    pretrained turn structure is preserved rather than relearned.
+  * Tool traffic uses Anthropic's tag + JSON-body convention:
+      <available_tools>  tool catalogue, in the system turn, one JSON per line
+      <tool_use>         one assistant tool call
+      <tool_result>      the harness response, delivered in a user turn
+  * Assistant trainable content is wrapped in {% generation %}, so the tokenizer
+    emits the assistant mask natively via
+    apply_chat_template(..., return_assistant_tokens_mask=True). Nothing else is
+    a training target: not the catalogue, not user text, not tool results.
+    Masking the catalogue or tool results teaches the model to invent tool
+    output — the most expensive silent failure in this format.
+  * The Anthropic tags are plain text rather than added special tokens, matching
+    Anthropic's own tokenizer and avoiding vocabulary surgery.
+-#}
+
+{%- set has_system = messages[0].role == 'system' -%}
+{%- set system = messages[0] if has_system else none -%}
+{%- set body = messages[1:] if has_system else messages -%}
+
+{#- The system turn is rendered separately so the message loop needs no special
+    case for "first message" and cannot double-render it.
+
+    The turn is emitted whenever a system message exists OR tools were declared.
+    Tying the catalogue to the presence of a system message would silently drop
+    every tool definition from records that have no system prompt, leaving the
+    model to see `tool_use` blocks it was never told about. -#}
+{%- set render_system = has_system or tools -%}
+{%- set body = messages[1:] if has_system else messages -%}
+
+{#- ------------------------------------------------------------- system turn -#}
+{%- if render_system -%}
+  {%- set system_text = (system.content | trim) if has_system else '' -%}
+  {{- '<|im_start|>system\n' -}}
+  {%- if system_text -%}
+    {{- system_text + '\n' -}}
+  {%- endif -%}
+  {%- if tools -%}
+    {%- if system_text -%}
+      {{- '\n' -}}
+    {%- endif -%}
+    {{- '<available_tools>\n' -}}
+    {%- for tool in tools -%}
+      {{- (tool | tojson) + '\n' -}}
+    {%- endfor -%}
+    {{- '</available_tools>' -}}
+  {%- endif -%}
+  {{- '<|im_end|>\n' -}}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ message turns -#}
+{%- for message in body -%}
+  {%- if message.role == 'user' -%}
+    {{- '<|im_start|>user\n' + (message.content | trim) -}}
+    {%- for image in message.images -%}
+      {{- '\n' + '<|vision_start|>' + image.vision_sequence + '<|vision_end|>' -}}
+    {%- endfor -%}
+    {{- '<|im_end|>\n' -}}
+  {%- elif message.role == 'tool' -%}
+    {{- '<|im_start|>user\n' -}}
+    {%- for result in message.results -%}
+      {{- '<tool_result>' + (result | tojson) + '</tool_result>\n' -}}
+    {%- endfor -%}
+    {{- '<|im_end|>\n' -}}
+  {%- elif message.role == 'assistant' -%}
+    {{- '<|im_start|>assistant\n' -}}
+    {% generation -%}
+      {%- set thinking = (message.reasoning_content or '') | trim -%}
+      {%- set text = (message.content or '') | trim -%}
+      {%- if thinking -%}
+        {{- thinking + '\n\n' -}}
+      {%- endif -%}
+      {%- if text -%}
+        {{- text + '\n' -}}
+      {%- endif -%}
+      {%- for call in message.tool_calls -%}
+        {%- set call_body = {'id': call.id, 'name': call.function.name, 'input': call.function.arguments} -%}
+        {{- '<tool_use>' + (call_body | tojson) + '</tool_use>\n' -}}
+      {%- endfor -%}
+    {%- endgeneration -%}
+    {{- '<|im_end|>\n' -}}
+  {%- else -%}
+    {{- raise_exception('Unexpected message role: ' ~ message.role) -}}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ------------------------------------------------------- generation prompt -#}
+{%- if add_generation_prompt -%}
+  {{- '<|im_start|>assistant\n' -}}
+  {%- if enable_thinking is defined and enable_thinking is false -%}
+    {{- '<think>\n\n</think>\n\n' -}}
+  {%- endif -%}
+{%- endif -%}

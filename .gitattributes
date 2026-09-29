@@ -1,0 +1,20 @@
+# The project is developed on Windows and run under WSL, so the tree crosses a
+# filesystem boundary that would otherwise rewrite line endings on checkout.
+# LF everywhere keeps the formatter's verdict identical on both sides.
+* text=auto eol=lf
+*.py text eol=lf
+*.jinja text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+
+# Local state and harness scratch space.
+.coverage
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
