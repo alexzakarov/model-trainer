@@ -39,13 +39,47 @@ söyleyip durur** — sessizce OOM'a düşmez.
 | 1 | Parametreler (model, repo, bağlam, `PUSH_EVERY`) | Tek yeri değiştirmen gereken yer |
 | 2 | **VRAM ön kontrolü** | 40 dakika sonra OOM öğrenmektense başta öğrenmek |
 | 3 | `git clone` + `pip install -e ".[dev,train]"` | Colab imajı değişir; sürümler burada sabitlenir |
-| 4 | Token (Colab secret ya da mock) | `HF_TOKEN` yoksa **başlamadan** hata |
-| 5 | **Kalite kapısı**: `pytest` | Kırık ağaca kanat takmadan önce 888 test (~1 dk) |
-| 6 | Go korpusunu indir, lisans süz, ölç | `terraform` (BUSL-1.1) ve `go-ethereum` (LGPL-3.0) varsayılan reddedilir |
-| 7 | Veriyi token'la, bağlam dışını **sayarak** at | Sessiz düşen kayıt ile küçük korpus ayırt edilemez |
-| 8 | **Maske doğrulaması** (`assert_mask_sane`) | Maske bozuksa model araç çıktısı uydurmayı öğrenir ve kayıp normal görünür |
-| 9 | `gotooltrain-train sft` + `--hub-*` | Asıl koşu |
-| 10 | Yayının okunması | "Push ettim" yetmez; *ne* gittiği okunmalı |
+| 4 | **Go toolchain**, sha256 doğrulamalı | Colab'da Go yok — aşağıya bak |
+| 5 | Token (Colab secret ya da mock) | `HF_TOKEN` yoksa **başlamadan** hata |
+| 6 | **Kalite kapısı**: `pytest -q -x -rs` | Kırık ağaca kanat takmadan önce ~2 dk test |
+| 7 | Go korpusunu indir, lisans süz, ölç | `terraform` (BUSL-1.1) ve `go-ethereum` (LGPL-3.0) varsayılan reddedilir |
+| 8 | Veriyi token'la, bağlam dışını **sayarak** at | Sessiz düşen kayıt ile küçük korpus ayırt edilemez |
+| 9 | **Maske doğrulaması** (`assert_mask_sane`) | Maske bozuksa model araç çıktısı uydurmayı öğrenir ve kayıp normal görünür |
+| 10 | `gotooltrain-train sft` + `--hub-*` | Asıl koşu |
+| 11 | Yayının okunması | "Push ettim" yetmez; *ne* gittiği okunmalı |
+
+## Neden defter Go kuruyor (4. hücre)
+
+Colab imajında Go **yoktur**. Bu bir eksik değil, kapının kırılma biçimidir:
+
+- Katalogdaki komutların çoğu `go` çağırır (`go_build`, `go_test`, `go_doc`).
+- Paketin kendi testleri **gerçek** komutları çalıştırır. Go yokken üçü kırılır ve
+  hata `the Go toolchain is required to verify a task but is not installed` olur —
+  yani proje eksik değil, **ortam** eksik görünür.
+
+Kurulum iki kurala uyuyor:
+
+- **Sabit + doğrulanmış.** `go1.23.6.linux-amd64.tar.gz`, go.dev'in kendi
+  `?mode=json` dizinindeki sha256'sıyla (`GO_SHA256`) karşılaştırılır; eşleşmeden
+  kurulmaz. Sandbox imajının rtk'ya uyguladığı kuralın aynısı: incelediğin şeyi sabitle,
+  indirilenin gerçekten o olduğunu kanıtla. `latest` kullanılmaz — bir Go sürümü
+  `go vet` tanılarını değiştirebilir ve iki koşu arasındaki farkı kimseye
+  atfedemezsin.
+- **`GOTOOLCHAIN=local`.** `go.mod`'daki `go 1.23` direktifinin ağdan toolchain
+  indirmesini engeller; testlerin ürettiği modüller ağ olmadan da derlenir. Sandbox
+  imajı da aynısını ayarlıyor.
+
+`apt-get install golang-go` **kullanılmıyor**: dağıtım paketi farklı bir Go sürümü ve
+`GOTOOLCHAIN=local` ile testlerin ürettiği modülleri reddedebilirdi.
+
+`os.environ["PATH"]` üzerinden kuruluyor (shell export'u değil), böylece **hem kalite
+kapısı hem eğitim koşusu** aynı toolchain'i görüyor. Shell'e kurulup sürece
+aktarılmayan bir Go, kapıdan geçer ve eğitimde patlar.
+
+**rtk kurulmuyor.** RTK değerlendirme harness'ının parçası, eğitimin değil; 15
+RTK testi gerekçeli olarak atlanır ve 6. hücre bunu `SKIPPED` satırlarıyla
+raporlar. Colab'da RTK'yi kurmak bu not defterinin amacına katkı sağlamıyor,
+sadece yeni bir arıza yüzeyi ekliyor.
 
 ## Periyodik yayınlama
 
@@ -135,6 +169,7 @@ içinde.
 |---|---|
 | Colab oturumu ~12 saat, bağlantı kopabilir | Yayın takvimi bunun için var. Kalan en fazla `PUSH_EVERY` adım. |
 | `target` dizini oturumla birlikte silinir | Tekrar çalıştırmak baştan indirir. `PUSH_EVERY`'yi küçültün ya da Drive'a bağlayın. |
-| Disk ~78 GB (Colab) | 4B bf16 ≈ 8,7 GB + Adafactor durumu + optimizer geçici dosyaları. `MAX_RECORDS` ile sınırlayın. |
+| Disk ~78 GB (Colab) | 4B bf16 ≈ 8,7 GB + Adafactor durumu + Go (~1,5 GB) + optimizer geçici dosyaları. `MAX_RECORDS` ile sınırlayın. |
 | Tam FT, LoRA değil | 4B'yi tek kartta tutmanın tek yolu Adafactor + gradient checkpointing. LoRA'ya düşmek **bu projenin kararı değil**, ayrı bir karar olurdu. |
 | Model card yok | `upload_folder` kart yazmaz. Depo boş olduğu için ilk push'tan sonra elle bir `README.md` gerekiyor; jenerik bir "uploaded to the Hub" kartı, kartın yokluğundan iyidir ama bilgi taşımaz. |
+| Üç test Go'ya bağımlı | `test_datacli`'daki iki görev testi ve `test_workspace`'taki `go mod tidy` testi. Go kurulu olduğu için koşar. Go'suz bir ortamda üçü de kırılır — ve hata kırık *paket* gibi görünür, eksik *bağımlılık* değil. |

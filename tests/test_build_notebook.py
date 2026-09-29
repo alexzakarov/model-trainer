@@ -20,6 +20,8 @@ from gotooltrain import build_notebook
 from gotooltrain.build_notebook import (
     DEFAULT_HF_REPO_ID,
     DEFAULT_REPO_URL,
+    GO_SHA256,
+    GO_VERSION,
     NOTEBOOK_PATH,
     assemble_notebook,
     build_cells,
@@ -113,7 +115,7 @@ def test_every_code_cell_is_valid_python() -> None:
 
 
 def test_the_cells_run_in_a_usable_order() -> None:
-    """Parameters, then the hardware check, then install, then data, then training.
+    """Parameters, hardware, install, Go, token, gate, data, training, verify.
 
     Checked by the marker each cell carries rather than by index arithmetic, so
     inserting a cell does not silently reorder the run.
@@ -124,14 +126,69 @@ def test_the_cells_run_in_a_usable_order() -> None:
         " 1 — Parameters",
         " 2 — GPU ön kontrolü",
         " 3 — Depoyu çek ve kur",
-        " 4 — Token: Colab secret ya da mock",
-        " 5 — Kalite kapısı (paket kendi testini koşar)",
-        " 6 — Go korpusunu indir, süz, ölç",
-        " 7 — SFT verisini token'la",
-        " 8 — Token formatını doğrula (eğitimden ÖNCE)",
-        " 9 — Eğitimi başlat (periyodik Hub yüklemesiyle)",
-        " 10 — Ne olduğunu doğrula",
+        " 4 — Go toolchain",
+        " 5 — Token: Colab secret ya da mock",
+        " 6 — Kalite kapısı (paket kendi testini koşar)",
+        " 7 — Go korpusunu indir, süz, ölç",
+        " 8 — SFT verisini token'la",
+        " 9 — Token formatını doğrula (eğitimden ÖNCE)",
+        " 10 — Eğitimi başlat (periyodik Hub yüklemesiyle)",
+        " 11 — Ne olduğunu doğrula",
     ]
+
+
+def test_the_go_toolchain_is_installed_before_the_quality_gate() -> None:
+    """The gate runs commands. Without Go it fails as a broken package.
+
+    Colab ships no Go, and the catalogue is mostly ``go build``/``go test``. So the
+    dependency has to arrive before the gate, or the gate reports a missing
+    toolchain as a broken project -- which is exactly the confusion this cell
+    removes.
+    """
+    joined = "\n".join(code_cells())
+    assert joined.index("go.dev/dl") < joined.index('"pytest", "-q')
+
+
+def test_the_go_download_is_verified_before_it_is_used() -> None:
+    """An unverified toolchain is an unreviewed one; the digest is the review artefact."""
+    joined = "\n".join(code_cells())
+    assert GO_SHA256 in joined
+    verify = joined.index("hashlib.sha256")
+    unpack = joined.index("tarfile.open")
+    assert verify < unpack, "the bytes were unpacked before they were checked"
+
+
+def test_the_go_version_is_pinned_not_latest() -> None:
+    """A drifting toolchain makes a difference in test output unattributable."""
+    joined = "\n".join(code_cells())
+    assert GO_VERSION in joined
+    assert "latest" not in joined
+
+
+def test_the_go_toolchain_is_pinned_here_and_only_here() -> None:
+    """One place to update when the toolchain is bumped.
+
+    For the same reason the repo id is single-sourced: two toolchain versions in the
+    tree is a difference nobody chose, and a difference nobody chose is a
+    difference nobody can attribute.
+    """
+    package = pathlib.Path(build_notebook.__file__).parent
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(GO_SHA256) for path in package.glob("*.py")
+    )
+    assert occurrences == 1
+
+
+def test_the_go_install_makes_the_toolchain_visible_to_subprocesses() -> None:
+    """PATH is set in os.environ, not in a shell, so the gate and the run inherit it.
+
+    A Go installed into a shell's PATH and not the process environment is a Go the
+    quality gate never sees -- the run would pass the gate and fail the training.
+    """
+    joined = "\n".join(code_cells())
+    assert 'os.environ["PATH"]' in joined
+    assert "export PATH" not in joined
+    assert "GOTOOLCHAIN" in joined, "go.mod's toolchain directive must not reach the network"
 
 
 def test_the_expensive_checks_run_before_the_expensive_step() -> None:

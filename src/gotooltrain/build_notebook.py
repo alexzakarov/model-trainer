@@ -71,6 +71,95 @@ print(f"push to: {HF_REPO_ID} every {PUSH_EVERY} steps (dry_run={DRY_RUN})")
 """
 
 
+#: The Go toolchain the notebook installs, and the sha256 go.dev publishes for it.
+#:
+#: Pinned, not "latest". A Go release can change `go vet` diagnostics, and a
+#: toolchain that drifts between two runs of the same notebook makes a difference in
+#: test output impossible to attribute. The digest is go.dev's own
+#: ``?mode=json`` entry for ``go1.23.6.linux-amd64.tar.gz``; the download is refused
+#: unless the bytes hash to it. This is the same pin-then-verify rule the sandbox
+#: Dockerfile applies to rtk, for the same reason: a toolchain that is not provably
+#: the intended one produces scores nobody can trust.
+GO_VERSION: Final[str] = "1.23.6"
+GO_SHA256: Final[str] = "9379441ea310de000f33a4dc767bd966e72ab2826270e038e78b2c53c2e7802d"
+
+#: Where the toolchain is unpacked. Not on PATH by default in a Colab image, and a
+#: symlink into /usr/local/bin would be a second, silently-different installation.
+GO_ROOT: Final[str] = "/usr/local/go"
+
+
+def _go_cell() -> dict[str, Any]:
+    """Install the Go toolchain, verified, before anything that shells out to it.
+
+    Colab ships no Go. That is not a cosmetic gap: the catalogue's commands are
+    ``go build``/``go test``/``go doc``, the package's own suite exercises the real
+    commands, and without Go those tests fail as *a broken package* rather than
+    reporting the missing dependency. So the dependency is installed here, and the
+    quality gate downstream can mean something.
+
+    Deliberately a download rather than ``apt-get install golang-go``: the distro
+    package is a different Go version than the one the project's documents and
+    sandbox image name, and ``GOTOOLCHAIN=local`` would then refuse the modules the
+    tests generate.
+    """
+    return _code(f"""
+# @title 4 — Go toolchain
+#
+# Colab'da Go yok. Bu bir eksik değil, kırık bir paket gibi okunur: katalogdaki
+# komutların çoğu `go` çağırır ve `go test` gerçekten koşmadığında kalite kapısı
+# "harness bozuk" diye kırılır. Bu yüzden kurulum kapıdan *önce* yapılıyor.
+#
+# Doğrulama: go.dev'in yayınladığı sha256 sabitlendi. İndirilen baytlar bu değerle
+# eşleşmeden kurulmuyor. Sandbox imajı da aynı kuralı uyguluyor.
+#
+# GOTOOLCHAIN=local: go.mod'daki `go 1.23` direktifinin ağdan toolchain indirmesini
+# engeller — yani testlerin ürettiği modüller ağ olmadan da derlenir.
+
+import hashlib
+import io
+import pathlib
+import shutil
+import tarfile
+import urllib.request
+
+GO_VERSION = {GO_VERSION!r}
+GO_SHA256 = {GO_SHA256!r}
+GO_ROOT = {GO_ROOT!r}
+
+archive = f"go{{GO_VERSION}}.linux-amd64.tar.gz"
+url = f"https://go.dev/dl/{{archive}}"
+print(f"indiriliyor: {{url}}")
+
+with urllib.request.urlopen(url, timeout=300) as response:
+    payload = response.read()
+
+digest = hashlib.sha256(payload).hexdigest()
+print(f"sha256      : {{digest}}")
+if digest != GO_SHA256:
+    raise SystemExit(
+        f"Go tarball doğrulanamadı. İndirilen {{digest}}, beklenen {{GO_SHA256}}. "
+        "Kurulum iptal edildi — sağlıksız bir toolchain ile devam etmek, eksik "
+        "bir toolchain'den daha kötüdür."
+    )
+
+root = pathlib.Path(GO_ROOT)
+if root.exists():
+    shutil.rmtree(root)
+with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+    try:
+        tar.extractall(root.parent, filter="data")
+    except TypeError:  # Python < 3.12 has no filter argument
+        tar.extractall(root.parent)
+
+os.environ["PATH"] = f"{{root / 'bin'}}:{{os.environ['PATH']}}"
+os.environ["GOTOOLCHAIN"] = "local"
+
+# `run` 3. hücreden; subprocess os.environ'ı miras alır, dolayısıyla hem eğitim
+# koşusu hem kalite kapısı aynı toolchain'i görür.
+print(run("go", "version"))
+""")
+
+
 def _parameters_cell() -> dict[str, Any]:
     """The one cell an operator edits, with both remotes interpolated from constants.
 
@@ -115,10 +204,11 @@ Bu defter şunu yapar, başka hiçbir şeyi:
 
 1. Depoyu remote'dan çeker (`alexzakarov/model-trainer`).
 2. `pip install -e ".[dev,train]"` ile kurar.
-3. Go-UT-Bench korpusunu indirip ölçer (lisans süzgeci dahil).
-4. Token formatını **gerçek Qwen3.5-4B tokenizer'ıyla** doğrular — maske yanlışsa
+3. Go toolchain'i **sha256 doğrulayarak** kurar (Colab'da Go yok).
+4. Go-UT-Bench korpusunu indirip ölçer (lisans süzgeci dahil).
+5. Token formatını **gerçek Qwen3.5-4B tokenizer'ıyla** doğrular — maske yanlışsa
    burada durur, GPU saatleri harcanmaz.
-5. 4B tam fine-tune'u başlatır ve **her N adımda** checkpoint'ı Hub'a gönderir.
+6. 4B tam fine-tune'u başlatır ve **her N adımda** checkpoint'ı Hub'a gönderir.
 
 ---
 
@@ -221,9 +311,10 @@ os.chdir(target)
 print("cwd:", os.getcwd())
 """
         ),
+        _go_cell(),
         _code(
             """
-# @title 4 — Token: Colab secret ya da mock
+# @title 5 — Token: Colab secret ya da mock
 #
 # Proje kuralı: sessiz düşüş yok. Token yoksa yayınlama başlamadan hata verir —
 # çünkü 700 adım sonra öğrenmek, 700 adım önce öğrenmekten pahalıdır.
@@ -258,16 +349,21 @@ print("hub client hazır")
         ),
         _code(
             """
-# @title 5 — Kalite kapısı (paket kendi testini koşar)
+# @title 6 — Kalite kapısı (paket kendi testini koşar)
 #
 # Colab'a kurduğumuz şeyin bu depodakiyle aynı şey olduğunu doğrulamadan 4B
 # eğitimi başlatmak, 4B eğitimi başlatmadan önce yapılabilecek en pahalı kontrolü
-# atlamak olurdu. 888 test ~1 dakika sürer; 4B bir epoch saatler sürer.
+# atlamak olurdu. Testler ~2 dakika sürer; 4B bir epoch saatler sürer.
+#
+# -x: ilk kırıklıkta dur. Kapının amacı "bir şeyler yanlış" demek, listelemek değil.
+# Docker ve rtk testleri yoksa *atlanır* (gerekçeleri skip metninde) — bu, eksik
+# bağımlılığın sessizce yeşile dönmesi değil, açıkça raporlanmasıdır. Son satırda
+# kaç testin atlandığını ve nedenini görüyorsunuz.
 
 import subprocess
 
 started = subprocess.run(
-    [sys.executable, "-m", "pytest", "-q", "-x"],
+    [sys.executable, "-m", "pytest", "-q", "-x", "-rs"],
     cwd=target,
     capture_output=True,
     text=True,
@@ -275,17 +371,26 @@ started = subprocess.run(
 )
 print(started.stdout[-3000:])
 print(started.stderr[-2000:])
+
+skipped = [line for line in started.stdout.splitlines() if line.startswith("SKIPPED")]
+if skipped:
+    print(f"\\n--- atlanan testler ({len(skipped)}) ve gerekçeleri ---")
+    for line in skipped:
+        print(" ", line)
+
 if started.returncode != 0:
     raise SystemExit(
         "Kalite kapısı kırmızı. Eğitime başlamak, kırık bir ağaca kanat takmak olurdu. "
-        "Yukarıdaki çıktıya bakın."
+        "Yukarıdaki çıktıya bakın. "
+        f"(Atlanan test: {len(skipped)} — bir bağımlılık eksikse bu normal; "
+        "kırmızı bir test normal değil.)"
     )
 print("kapı yeşil")
 """
         ),
         _code(
             """
-# @title 6 — Go korpusunu indir, süz, ölç
+# @title 7 — Go korpusunu indir, süz, ölç
 #
 # `go-pairs` lisans süzgecini uygular: Go-UT-Bench "permissive" diyor ama
 # terraform BUSL-1.1, go-ethereum LGPL-3.0. İkisi de varsayılan olarak reddedilir
@@ -305,7 +410,7 @@ print(open("data/go-dapt-report.json", encoding="utf-8").read()[:1200])
         ),
         _code(
             """
-# @title 7 — SFT verisini token'la
+# @title 8 — SFT verisini token'la
 #
 # Buradaki veri Go-UT-Bench'in *birim testi yaz* görevleridir; değerlendirme
 # trajektöri değil. Bu, yetenek ölçümü değil — format ve boru hattı denemesidir.
@@ -354,7 +459,7 @@ print(f"ortalama: {total_tokens // max(1, len(rendered))} token/kayıt")
         ),
         _code(
             """
-# @title 8 — Token formatını doğrula (eğitimden ÖNCE)
+# @title 9 — Token formatını doğrula (eğitimden ÖNCE)
 #
 # Maske bozuksa model araç çıktısı uydurmayı öğrenir ve kayıp normal görünür. Bu
 # kontrol dakikalar sürer, bir 4B epoch saatler sürer. Sıra burada.
@@ -382,7 +487,7 @@ print(tokenizer.decode(example.input_ids[:120], skip_special_tokens=False)[:300]
         ),
         _code(
             """
-# @title 9 — Eğitimi başlat (periyodik Hub yüklemesiyle)
+# @title 10 — Eğitimi başlat (periyodik Hub yüklemesiyle)
 #
 # Adafactor: ilk momenti tutmaz, ikinci momenti çarpanlaştırır. Optimizer durumu
 # birkaç GB yerine birkaç MB — tek kartta 4B'yi sığdıran şey bu.
@@ -428,7 +533,7 @@ print("exit:", result.returncode)
         ),
         _code(
             """
-# @title 10 — Ne olduğunu doğrula
+# @title 11 — Ne olduğunu doğrula
 #
 # "Push ettim" demek yetmez; push'un *ne* olduğu okunmalı. Yayınlanan klasör
 # kendi kökenini taşır: hangi adım, hangi ayarlar.
