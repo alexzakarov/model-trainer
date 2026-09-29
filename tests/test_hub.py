@@ -44,6 +44,11 @@ from gotooltrain.hub import (
 
 MOCK_TOKEN = "hf_mock_token_for_local_tests_not_a_real_credential"
 
+#: A repository id that does not exist, on purpose. The real publication target lives
+#: in one constant, ``build_notebook.DEFAULT_HF_REPO_ID``; a reader who copies a repo
+#: out of a test should be unable to publish anything by accident.
+FIXTURE_REPO = "example/not-a-real-repo"
+
 
 @pytest.fixture
 def token(monkeypatch: pytest.MonkeyPatch) -> str:
@@ -53,7 +58,7 @@ def token(monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 def policy(**overrides: Any) -> HubPushPolicy:
-    base: dict[str, Any] = {"repo_id": "alexzakarov/qwen3.5-4b-go", "every_steps": 2}
+    base: dict[str, Any] = {"repo_id": FIXTURE_REPO, "every_steps": 2}
     base.update(overrides)
     return HubPushPolicy(**base)
 
@@ -82,7 +87,7 @@ class FakeApi:
 
 def test_a_policy_names_its_target_and_interval() -> None:
     described = policy().describe()
-    assert "alexzakarov/qwen3.5-4b-go" in described
+    assert FIXTURE_REPO in described
     assert "every 2 step" in described
 
 
@@ -95,7 +100,7 @@ def test_a_dry_run_says_so_in_the_log_line() -> None:
 def test_a_policy_is_recorded_whole() -> None:
     record = policy(token_env="COLAB_HF", private=True).to_record()
     assert record == {
-        "repo_id": "alexzakarov/qwen3.5-4b-go",
+        "repo_id": FIXTURE_REPO,
         "every_steps": 2,
         "token_env": "COLAB_HF",
         "private": True,
@@ -232,7 +237,7 @@ def test_the_upload_creates_the_repo_then_sends_the_folder(
     assert revision == "0" * 40
     assert api.created == [
         {
-            "repo_id": "alexzakarov/qwen3.5-4b-go",
+            "repo_id": FIXTURE_REPO,
             "repo_type": REPO_TYPE_MODEL,
             "private": True,
             "exist_ok": True,
@@ -241,14 +246,14 @@ def test_the_upload_creates_the_repo_then_sends_the_folder(
     assert api.uploads == [
         {
             "folder_path": str(tmp_path),
-            "repo_id": "alexzakarov/qwen3.5-4b-go",
+            "repo_id": FIXTURE_REPO,
             "commit_message": "gotooltrain step 4/10",
         }
     ]
 
 
 def test_the_pusher_names_its_repo(token: None) -> None:
-    assert HfHubPusher(policy()).identity == "alexzakarov/qwen3.5-4b-go"
+    assert HfHubPusher(policy()).identity == FIXTURE_REPO
 
 
 def test_a_pusher_without_an_injected_client_builds_one(

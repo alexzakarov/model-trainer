@@ -16,10 +16,18 @@ kodunu `origin`'den çeker, paketi kurar, 4B modeli tam fine-tune eder ve checkp
 
 | Gereken | Neden |
 |---|---|
-| Depoda en az bir commit, `origin`'de | Defter `git clone` ile çekiyor. **Şu an `origin` boş** (`No commits yet on main`), ilk çalıştırma 3. hücrede durur. |
+| Depoda en az bir commit, `origin`'de | Defter `git clone` ile çekiyor. `main` artık `95b1aa3` üzerinde. |
 | Colab runtime: **A100 40 GB** | 4B tam FT + AdamW ≈ 18 GB (ağırlık + gradyan). T4'de (15 GB) matematiksel olarak sığmaz. |
-| Hub reposu + **yazma yetkili** token | `--hub-repo-id` verdiyseniz token'ın o repo'ya yazma yetkisi olmalı. |
+| Hub deposu: [`alexzakkarov/qwen3.5-golang`](https://huggingface.co/alexzakkarov/qwen3.5-golang) | Hedef. **Şu an boş** (dosya yok, model card yok) — ilk push onu doldurur. |
+| **O depoya yazma yetkili** token | Token'ın sahibi ile depo sahibi aynı hesap olmalı. `alexzakkarov` (HF) ile `alexzakarov` (GitHub) farklı yazımlardır; karışıklık bu iki harfin sessizce yer değiştirmesiyle başlar. |
 | Colab secret `HF_TOKEN` | Token'ı hücreye yazmak, onu notebook çıktısına ve git geçmişine sızdırır. |
+
+Hedef depo adı kodda **tek yerde** duruyor:
+[`build_notebook.py`](../src/gotooltrain/build_notebook.py) →
+`DEFAULT_HF_REPO_ID`. Not defteri, `--help` metni ve bu belge ondan türer;
+`test_the_publication_target_appears_exactly_once` bunu zorlar. Depo adı iki
+yerden biri güncellenirse koşu hâlâ çalışır ama checkpoint **kimsenin bakmadığı
+bir yere** düşer — bir yayın yolunun en kötü kısmi güncellemesi odur.
 
 VRAM ön kontrolü defterin 2. hücresindedir ve yetersizse **adını ve gerekeni
 söyleyip durur** — sessizce OOM'a düşmez.
@@ -46,7 +54,7 @@ gotooltrain-train sft \
   --model Qwen/Qwen3.5-4B --output runs/colab-sft \
   --dataset data/sft.jsonl \
   --optimizer adafactor --gradient-checkpointing \
-  --hub-repo-id alexzakarov/qwen3.5-4b-go \
+  --hub-repo-id alexzakkarov/qwen3.5-golang \
   --hub-push-every 25
 ```
 
@@ -128,4 +136,5 @@ içinde.
 | Colab oturumu ~12 saat, bağlantı kopabilir | Yayın takvimi bunun için var. Kalan en fazla `PUSH_EVERY` adım. |
 | `target` dizini oturumla birlikte silinir | Tekrar çalıştırmak baştan indirir. `PUSH_EVERY`'yi küçültün ya da Drive'a bağlayın. |
 | Disk ~78 GB (Colab) | 4B bf16 ≈ 8,7 GB + Adafactor durumu + optimizer geçici dosyaları. `MAX_RECORDS` ile sınırlayın. |
-| Tam FT, lora değil | 4B'yi tek kartta tutmanın tek yolu Adafactor + gradient checkpointing. LoRA'ya düşmek **bu projenin kararı değil**, ayrı bir karar olurdu. |
+| Tam FT, LoRA değil | 4B'yi tek kartta tutmanın tek yolu Adafactor + gradient checkpointing. LoRA'ya düşmek **bu projenin kararı değil**, ayrı bir karar olurdu. |
+| Model card yok | `upload_folder` kart yazmaz. Depo boş olduğu için ilk push'tan sonra elle bir `README.md` gerekiyor; jenerik bir "uploaded to the Hub" kartı, kartın yokluğundan iyidir ama bilgi taşımaz. |

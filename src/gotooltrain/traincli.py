@@ -143,8 +143,9 @@ def _add_shared(parser: argparse.ArgumentParser) -> None:
         "--hub-repo-id",
         default=None,
         help=(
-            "Hugging Face model repo to publish to, e.g. alexzakarov/qwen3.5-4b-go. "
-            "Omit to keep the checkpoint on this machine only."
+            "Hugging Face model repo to publish to, as <namespace>/<name>. Omit to keep the "
+            "checkpoint on this machine only. The target of this project's own Colab run is "
+            "build_notebook.DEFAULT_HF_REPO_ID."
         ),
     )
     group.add_argument(

@@ -356,7 +356,7 @@ biçimlendirmesinden ayırt edemez.
 ```bash
 gotooltrain-eval queue \
   --store .evalstore --tasks holdout.jsonl \
-  --model Qwen/Qwen3.5-4B-go --revision step2000 --dataset-version go-ut-bench-1 \
+  --model alexzakkarov/qwen3.5-golang --revision step2000 --dataset-version go-ut-bench-1 \
   --model-url http://localhost:8000/v1 \
   --sandbox docker --image golang:1.23-bookworm --workers 8 \
   --out .evalstore/queue.jsonl
@@ -364,7 +364,7 @@ gotooltrain-eval queue \
 # oturumda queue'yu oku, verdict'leri yaz, sonra:
 gotooltrain-eval judge \
   --store .evalstore --tasks holdout.jsonl \
-  --model Qwen/Qwen3.5-4B-go --revision step2000 --dataset-version go-ut-bench-1 \
+  --model alexzakkarov/qwen3.5-golang --revision step2000 --dataset-version go-ut-bench-1 \
   --run-id run-1 --queue .evalstore/queue.jsonl --verdicts verdicts.jsonl
 ```
 

@@ -20,6 +20,11 @@ from gotooltrain.traincli import main
 
 TOOLS = [tool.to_openai() for tool in GO_TOOLS]
 
+#: A repository id that does not exist, on purpose. The real publication target is one
+#: constant, ``build_notebook.DEFAULT_HF_REPO_ID``; a reader who copies a repo out of
+#: a test should be unable to publish anything by accident.
+FIXTURE_REPO = "example/not-a-real-repo"
+
 
 def record(messages: list[dict[str, Any]]) -> dict[str, Any]:
     return {"messages": messages, "tools": TOOLS}
@@ -334,7 +339,7 @@ def test_a_run_with_a_named_repo_publishes_on_schedule(
     args = [
         *sft_args(tmp_path, tiny_checkpoint, dataset(tmp_path)),
         "--hub-repo-id",
-        "alexzakarov/qwen3.5-4b-go",
+        FIXTURE_REPO,
         "--hub-push-every",
         "1",
         "--hub-dry-run",
@@ -350,12 +355,12 @@ def test_a_run_with_a_named_repo_publishes_on_schedule(
 
     err = captured.err
     assert "DRY RUN" in err, "a rehearsal must not read like a publication in the log"
-    assert "alexzakarov/qwen3.5-4b-go" in err
+    assert FIXTURE_REPO in err
     # The published folder describes itself, so a checkpoint found on the Hub says
     # which hyperparameters produced it without a run directory to correlate.
     state = json.loads((tmp_path / "out" / "hub_push.json").read_text(encoding="utf-8"))
     assert state["step"] == 1
-    assert state["plan"]["hub"]["repo_id"] == "alexzakarov/qwen3.5-4b-go"
+    assert state["plan"]["hub"]["repo_id"] == FIXTURE_REPO
 
 
 def test_a_run_with_no_repo_records_no_publication_in_the_plan(tmp_path: pathlib.Path) -> None:
@@ -391,7 +396,7 @@ def test_the_publication_flags_are_all_reachable_from_the_command_line(
         tmp_path,
         [
             "--hub-repo-id",
-            "alexzakarov/qwen3.5-4b-go",
+            FIXTURE_REPO,
             "--hub-push-every",
             "7",
             "--hub-token-env",
@@ -400,7 +405,7 @@ def test_the_publication_flags_are_all_reachable_from_the_command_line(
             "--hub-dry-run",
         ],
     )
-    assert args.hub_repo_id == "alexzakarov/qwen3.5-4b-go"
+    assert args.hub_repo_id == FIXTURE_REPO
     assert args.hub_push_every == 7
     assert args.hub_token_env == "COLAB_HF"
     assert args.hub_private is True
@@ -413,11 +418,11 @@ def test_a_named_repo_becomes_a_policy_recorded_in_the_plan(tmp_path: pathlib.Pa
 
     args = parsed(
         tmp_path,
-        ["--hub-repo-id", "alexzakarov/qwen3.5-4b-go", "--hub-push-every", "25", "--hub-private"],
+        ["--hub-repo-id", FIXTURE_REPO, "--hub-push-every", "25", "--hub-private"],
     )
     plan = _plan(args)
     assert plan.hub is not None
-    assert plan.hub.repo_id == "alexzakarov/qwen3.5-4b-go"
+    assert plan.hub.repo_id == FIXTURE_REPO
     assert plan.hub.every_steps == 25
     assert plan.hub.private is True
     assert plan.hub.dry_run is False

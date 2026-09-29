@@ -18,6 +18,7 @@ import pytest
 
 from gotooltrain import build_notebook
 from gotooltrain.build_notebook import (
+    DEFAULT_HF_REPO_ID,
     DEFAULT_REPO_URL,
     NOTEBOOK_PATH,
     assemble_notebook,
@@ -69,6 +70,37 @@ def test_the_default_repository_is_the_one_this_project_uses() -> None:
     """A notebook that clones a stale URL fails at the first cell, hours in."""
     assert DEFAULT_REPO_URL.endswith("model-trainer.git")
     assert any(DEFAULT_REPO_URL in source for source in code_cells())
+
+
+def test_the_publication_target_is_written_once_in_the_source() -> None:
+    """One place in the *codebase* to edit, so a renamed repo cannot be half-renamed.
+
+    The generated notebook may name the repo as many times as it likes -- those
+    renderings all come from the same constant. What must not happen is a second
+    developer typing the literal into another module, where a rename would leave
+    the two silently disagreeing: the run trains, the checkpoint uploads, and it
+    lands somewhere nobody is looking.
+    """
+    package = pathlib.Path(build_notebook.__file__).parent
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(DEFAULT_HF_REPO_ID) for path in package.glob("*.py")
+    )
+    assert occurrences == 1, (
+        f"{DEFAULT_HF_REPO_ID} is written in more than one module; keep it in "
+        "build_notebook.DEFAULT_HF_REPO_ID and interpolate"
+    )
+
+
+def test_the_publication_target_is_named_in_the_notebook() -> None:
+    assert DEFAULT_HF_REPO_ID in "\n".join(code_cells())
+
+
+def test_the_target_repo_is_a_plausible_hub_id() -> None:
+    """``namespace/name`` -- an id without both halves is not a repo id at all."""
+    namespace, _, name = DEFAULT_HF_REPO_ID.partition("/")
+    assert namespace and name
+    assert " " not in DEFAULT_HF_REPO_ID
+    assert DEFAULT_HF_REPO_ID.strip() == DEFAULT_HF_REPO_ID
 
 
 # ------------------------------------------------------------------ the cells
@@ -153,10 +185,10 @@ def test_the_notebook_says_what_the_run_does_not_measure() -> None:
 
 
 def test_the_notebook_names_the_blocker_in_the_empty_remote() -> None:
-    """The remote has no commits yet, so the first cell would fail without saying why."""
+    """A notebook that clones a stale ref fails at the first cell, hours in."""
     markdown = "\n".join(sources(c) for c in build_cells() if c["cell_type"] == "markdown")
-    assert "No commits yet" in markdown
-    assert "git push" in markdown
+    assert "REPO_REF" in markdown
+    assert "95b1aa3" in markdown
 
 
 def test_the_token_is_never_written_into_a_cell() -> None:

@@ -20,6 +20,14 @@ from .errors import ToolTrainError
 #: there is one, so the notebook cannot drift from the remote it is meant to fetch.
 DEFAULT_REPO_URL: Final[str] = "https://github.com/alexzakarov/model-trainer.git"
 
+#: The Hub model repo the trained checkpoint is published to.
+#:
+#: The single place this name appears in code. The notebook's parameter cell is built
+#: from it, the test asserts it appears exactly once, and the documentation quotes it.
+#: A target written into three files is a target that gets half-renamed when the repo
+#: is renamed -- and half of a publication path is the worst possible amount of it.
+DEFAULT_HF_REPO_ID: Final[str] = "alexzakkarov/qwen3.5-golang"
+
 #: Where the notebook is written, relative to the project root.
 NOTEBOOK_PATH: Final[Path] = Path("notebooks") / "gotooltrain_colab.ipynb"
 
@@ -39,6 +47,53 @@ def _code(source: str) -> dict[str, Any]:
         "outputs": [],
         "source": source.strip("\n").splitlines(True),
     }
+
+
+#: The cell a reader edits. Split into a generated header and a static body so the
+#: target repo is interpolated from :data:`DEFAULT_HF_REPO_ID` rather than typed in
+#: twice -- the body is full of f-strings, so the whole cell cannot be one template.
+_PARAMETERS_BODY = """
+# Eğitim
+CONTEXT_LENGTH = 8192                  # 32768 tek kartta sığmaz; 8K repo düzeyi iş için yeterli
+EPOCHS = 1
+BATCH_SIZE = 1
+GRAD_ACCUM = 8
+LEARNING_RATE = 1e-5
+MAX_RECORDS = 400                      # korpus 4491 kayıt; süreyi sınırlamak için kes
+MAX_TOKENS_PER_RECORD = CONTEXT_LENGTH  # üstünü atılır, *sayısı raporlanır*
+
+# Yayınlama
+PUSH_EVERY = 25                        # optimizer adımı
+
+print(f"repo   : {REPO_URL}@{REPO_REF}")
+print(f"model  : {MODEL_ID}")
+print(f"push to: {HF_REPO_ID} every {PUSH_EVERY} steps (dry_run={DRY_RUN})")
+"""
+
+
+def _parameters_cell() -> dict[str, Any]:
+    """The one cell an operator edits, with both remotes interpolated from constants.
+
+    The token stays an obvious placeholder in the generated file. A notebook that
+    carries a real credential is a credential in the git history, and the literal
+    would sit in *this* file rather than in a secret store.
+    """
+    header = f"""
+# @title 1 — Parameters
+#
+# Buradaki değerler mock olarak girdi. Gerçek koşuda HF_TOKEN'ı Colab Secrets'a
+# (🔑 soldaki panel) koy; buraya yazmak token'ı notebook çıktısına ve git geçmişine
+# sızdırır.
+
+REPO_URL = {DEFAULT_REPO_URL!r}
+REPO_REF = "main"                      # commit sha da olabilir; sha daha tekrarlanabilir
+
+MODEL_ID = "Qwen/Qwen3.5-4B"          # eğitilecek taban model
+HF_REPO_ID = {DEFAULT_HF_REPO_ID!r}    # hedef Hub deposu
+HF_TOKEN = "hf_mock_replace_me"        # mock — Colab Secrets'tan okunacak
+DRY_RUN = False                        # True: takvimi prova et, hiçbir şey yükleme
+"""
+    return _code(header + _PARAMETERS_BODY)
 
 
 def build_cells() -> list[dict[str, Any]]:
@@ -67,16 +122,17 @@ Bu defter şunu yapar, başka hiçbir şeyi:
 
 ---
 
-## ⚠️ Çalıştırmadan önce: repo henüz push edilmemiş
+## ⚠️ `REPO_REF`'i sabitle
 
-Bu not defteri `origin`'i çekiyor. Depoda **hiç commit yok** (`No commits yet on
-main`), yani ilk çalıştırma `git clone` aşamasında başarısız olacak. Önce:
+`REPO_REF` şu an `main`. Bu **bir kez çalışmak** içindir: yarın aynı defteri
+çalıştırmak farklı kod demektir. `95b1aa3` gibi bir commit sha'sına sabitle,
+böylece aynı komut aynı kodu çeker.
 
-```bash
-git add -A && git commit -m "..." && git push -u origin main
-```
+## ⚠️ Token'ın yazma yetkisi
 
-Bu, defterin kusuru değil: uzak depoda içerik yoksa çekilecek bir şey de yoktur.
+Hedef depo 1. hücredeki `HF_REPO_ID`. `HF_TOKEN`'ın o depoya **yazma** yetkisi
+olmalı. Depo şu an boş; ilk push onu doldurur. `upload_folder` model card yazmaz
+— kart elle eklenir.
 
 ## ⚠️ GPU seçimi
 
@@ -92,39 +148,7 @@ Bu, defterin kusuru değil: uzak depoda içerik yoksa çekilecek bir şey de yok
 Aşağıdaki hücre yetersiz VRAM'i sessizce geçmez — adını ve nedenini söyler.
 """
         ),
-        _code(
-            """
-# @title 1 — Parameters
-#
-# Buradaki değerler mock olarak girdi. Gerçek koşuda HF_TOKEN'ı Colab Secrets'a
-# (🔑 soldaki panel) koy; buraya yazmak token'ı notebook çıktısına ve git geçmişine
-# sızdırır.
-
-REPO_URL = "https://github.com/alexzakarov/model-trainer.git"
-REPO_REF = "main"                      # commit sha da olabilir; sha daha tekrarlanabilir
-
-MODEL_ID = "Qwen/Qwen3.5-4B"          # eğitilecek taban model
-HF_REPO_ID = "alexzakarov/qwen3.5-4b-go"  # hedef Hub deposu
-HF_TOKEN = "hf_mock_replace_me"        # mock — Colab Secrets'tan okunacak
-DRY_RUN = False                        # True: takvimi prova et, hiçbir şey yükleme
-
-# Eğitim
-CONTEXT_LENGTH = 8192                  # 32768 tek kartta sığmaz; 8K repo düzeyi iş için yeterli
-EPOCHS = 1
-BATCH_SIZE = 1
-GRAD_ACCUM = 8
-LEARNING_RATE = 1e-5
-MAX_RECORDS = 400                      # korpus 4491 kayıt; süreyi sınırlamak için kes
-MAX_TOKENS_PER_RECORD = CONTEXT_LENGTH  # üstünü atılır, *sayısı raporlanır*
-
-# Yayınlama
-PUSH_EVERY = 25                        # optimizer adımı
-
-print(f"repo   : {REPO_URL}@{REPO_REF}")
-print(f"model  : {MODEL_ID}")
-print(f"push to: {HF_REPO_ID} every {PUSH_EVERY} steps (dry_run={DRY_RUN})")
-"""
-        ),
+        _parameters_cell(),
         _code(
             """
 # @title 2 — GPU ön kontrolü

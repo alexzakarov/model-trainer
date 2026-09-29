@@ -19,7 +19,7 @@ yeteneğine sahip bir modele tam fine-tune etmek için çalışma alanı.
 | 6 — Execution reward + DPO (tercih verisi + kayıp + döngü) | ✅ Tamamlandı |
 | 7 — Gerçek 4B checkpoint ile GPU koşusu | ⏳ Donanım gerektiriyor — [Colab defteri](notebooks/gotooltrain_colab.ipynb) hazır |
 
-Kalite kapıları: **953 test (Windows, Docker'suz) / 975 (Docker ve rtk ile)**,
+Kalite kapıları: **956 test (Windows, Docker'suz) / 978 (Docker ve rtk ile)**,
 coverage %100 (satır + dal), ruff temiz, mypy strict temiz (29 modül).
 
 > Atlanan testler sessiz değil, gerekçeleri skip metninde yazılı: 20'si
@@ -74,23 +74,23 @@ src/gotooltrain/
 ```bash
 # Değerlendirme: ajan döngüsünü koştur, judge kuyruğunu yaz
 gotooltrain-eval queue --store runs/main --tasks tasks.json \
-  --model Qwen/Qwen3.5-4B-go --revision rev-a --dataset-version holdout-1 \
+  --model alexzakkarov/qwen3.5-golang --revision rev-a --dataset-version holdout-1 \
   --model-url http://localhost:8000/v1 --out queue.jsonl \
   --sandbox docker --fixture repo/ --workers 8
 
 # Judge verdict'larını al, skorlu raporu yaz
 gotooltrain-eval judge --store runs/main --tasks tasks.json \
-  --model Qwen/Qwen3.5-4B-go --revision rev-a --dataset-version holdout-1 \
+  --model alexzakkarov/qwen3.5-golang --revision rev-a --dataset-version holdout-1 \
   --run-id run-001 --queue queue.jsonl --verdicts verdicts.jsonl
 
 # Eğitim verisi: yalnızca judge'ın başarılı bulduğu trajektöriler
 gotooltrain-data mine --store runs/main --tasks tasks.json \
-  --model Qwen/Qwen3.5-4B-go --revision rev-a --dataset-version holdout-1 \
+  --model alexzakkarov/qwen3.5-golang --revision rev-a --dataset-version holdout-1 \
   --seed 7 --out sft.jsonl --report mine-report.json
 
 # Tercih verisi: aynı görevin geçen ve kalan örneklerinden çift
 gotooltrain-data preferences --store runs/main --tasks tasks.json \
-  --model Qwen/Qwen3.5-4B-go --revision rev-a --dataset-version holdout-1 \
+  --model alexzakkarov/qwen3.5-golang --revision rev-a --dataset-version holdout-1 \
   --n-samples 4 --out pairs.jsonl --report pref-report.json
 
 # Go DAPT korpusu: indir, lisans süzgecinden geçir, ölç
@@ -124,7 +124,7 @@ Ayrıntılar ve maliyet notları: [`docs/COLAB.md`](docs/COLAB.md).
 HF_TOKEN=... gotooltrain-train sft \
   --model Qwen/Qwen3.5-4B --output runs/colab-sft --dataset data/sft.jsonl \
   --optimizer adafactor --gradient-checkpointing --max-length 8192 \
-  --hub-repo-id alexzakarov/qwen3.5-4b-go --hub-push-every 25
+  --hub-repo-id alexzakkarov/qwen3.5-golang --hub-push-every 25
 
 # Takvimi hiçbir şey yüklemeden prova et
 gotooltrain-train sft ... --hub-repo-id a/b --hub-dry-run
@@ -149,7 +149,7 @@ make coverage     # coverage run -m pytest && coverage report  (eşik %100)
 > branch'siz veri yazıp koşuyu
 > *"Can't combine statement coverage data with branch data"* ile düşürüyor.
 
-Dördü de yeşil: **953 test geçti (22 atlandı, gerekçeli), coverage %100, ruff temiz,
+Dördü de yeşil: **956 test geçti (22 atlandı, gerekçeli), coverage %100, ruff temiz,
 mypy strict temiz.**
 
 `train()` ve `train_dpo()` gerçek mimariyle çalışır: testler `Qwen3.5-4B`
