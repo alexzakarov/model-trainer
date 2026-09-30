@@ -386,6 +386,7 @@ if total_gb < MIN_GB:
 # REF bir commit sha ise tam tekrarlanabilir olur. 'main' daha basit ama yarın
 # aynı defteri çalıştırmak farklı kod demektir.
 
+import importlib
 import os
 import subprocess
 import sys
@@ -435,7 +436,19 @@ print("cwd:", os.getcwd())
 # ve zaten yolunu bulur.
 sys.path.insert(0, os.path.join(target, "src"))
 
+# Ama bir tuzak daha var ve bu seviyesiz: `import`, `sys.modules`'tan önbelleklenir.
+# Bu hücreyi **ikinci kez** çalıştırırsan kod yeni (pull edildi) ama çekirdek
+# eski modülü kullanmaya devam ediyor. Ölçtüm: pull sonrası `import` hâlâ bir
+# önceki sürümü döndürüyor. Sonucu görmek kolay: 8192 bağlamı yine OOM eder —
+# ama bu kez "40 GB'a sığdırdık" diye düşünürsün, çünkü bellek bütçesi hücrede
+# güzel görünüyor. O yüzden önbellek düşürülüyor; `invalidate_caches()` olmadan
+# silmek yetmiyor, çünkü bayt-kod önbelleği ayrı tutuluyor.
+for _name in [n for n in list(sys.modules) if n == "gotooltrain" or n.startswith("gotooltrain.")]:
+    del sys.modules[_name]
+importlib.invalidate_caches()
+
 import gotooltrain  # noqa: E402
+from gotooltrain.train import completion_only_loss, enter_training_mode  # noqa: E402
 
 print("gotooltrain:", gotooltrain.__version__, "->", gotooltrain.__file__)
 
@@ -446,6 +459,20 @@ if not gotooltrain.__file__.startswith(target):
         f"gotooltrain {gotooltrain.__file__} konumundan geliyor, klon {target} değil. "
         "Sistemde başka bir kurulum var ve eğitimi yanlış kodla yapacağız."
     )
+
+# Yol doğruysa bu artık *çekilen* kod. Yine de koşunun bağlı olduğu yetenekler
+# gerçekten var mı diye bakılıyor. `REPO_REF`'i eski bir revizyona sabitlemişsen
+# koşu iki saat sonra OOM ederek değil, burada açık bir mesajla durur. "Not
+# defteri çalıştı" ile "koşunun istediği kodla çalıştı" aynı şey değil.
+_yetenekler = ("enter_training_mode", "completion_only_loss", "DEFAULT_MEMORY_BUDGET_GB")
+_eksik = [n for n in _yetenekler if not hasattr(gotooltrain.train, n)]
+if _eksik:
+    raise SystemExit(
+        f"{REPO_REF} revizyonu bu koşunun ihtiyaç duyduğu yeteneklerden yoksun: "
+        f"{', '.join(_eksik)}. Bellek bütçesinin işe yaraması bunlar olmadan "
+        "mümkün değil; yeni bir revizyona sabitle ya da Runtime'ı yeniden başlat."
+    )
+print("40 GB koşusunun ihtiyaç duyduğu yetenekler: tamam")
 """
         ),
         _toolchain_cell(),
@@ -674,14 +701,23 @@ print(tokenizer.decode(example.input_ids[:120], skip_special_tokens=False)[:300]
 #
 # **--gradient-checkpointing burada belirleyici.** Bu modelde 32 katmanın 24'ü
 # Gated DeltaNet; duram [32 v_heads, 128, 128] yani token başına 1 MB. Aktivasyon
-# belleği bağlamla doğrusal büyür. Checkpointing olmadan 4096 token ~98 GB, 8192
-# ~196 GB. Etkinleşmesi için modelin *train* modunda olması gerekir
+# belleği bağlamla doğrusal büyür — tablo 8. hücrede, hesaplayan `--memory-budget-gb`.
+# Checkpointing'in etkinleşmesi için modelin *train* modunda olması gerekir
 # (`from_pretrained` eval modunda döndürür) — bu, sürümde artık düzeltildi.
 # Çalışma çıktısında "gradient checkpointing on: N module(s)" satırını **gör**;
-# yoksa bayrak hiç çalışmamış demektir.
+# yoksa bayrak hiç çalışmamış demekter.
 #
 # --hub-push-every: optimizer ADIMI sayar, batch değil. 8 kademe biriktirmeli
 # olduğu için "her batch'te gönder" demek accumulation ayarına bağımlı olurdu.
+#
+# **Bu hücreyi ikinci kez çalıştırırsan** `runs/colab-sft/training_plan.json`
+# zaten duruyor ve yeni planı reddeder: plan, koşunun ne olduğunun kaydı; üstüne
+# yazmak önceki koşunun ne olduğunu unutmak olurdu. Farklı bir plan için ya
+# `OUTPUT` dizinini değiştir ya da eski dizini **bilerek** sil:
+#
+#     !rm -rf runs/colab-sft
+#
+# Aynı parametrelerle tekrar çalıştırırsan sorun yok: plan aynı, kabul edilir.
 #
 # İlk koşuda DRY_RUN=True ile başla: pahalı hücrelerden geçer, takvimi ve
 # dosyer yazımını prova eder, tek bir bayt göndermez. Yeşil görünce DRY_RUN=False

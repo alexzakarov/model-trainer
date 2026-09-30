@@ -43,6 +43,22 @@ def code_cells() -> list[str]:
     return [sources(c) for c in build_cells() if c["cell_type"] == "code"]
 
 
+def install_cell() -> dict[str, object]:
+    """The cell that pulls and installs, found by what it does rather than by index.
+
+    Cell order is a presentation choice; what this cell is for is not, so the test
+    names it by its content and stays valid if the notebook gains a cell.
+    """
+    for cell in build_cells():
+        if (
+            cell["cell_type"] == "code"
+            and "pip install" in sources(cell)
+            and "git" in sources(cell)
+        ):
+            return cell
+    raise AssertionError("no cell pulls and installs the repository")
+
+
 # ---------------------------------------------------------------- the document
 
 
@@ -493,6 +509,58 @@ def test_the_reader_is_told_which_term_of_the_estimate_is_fuzzy() -> None:
     parameters = "\n".join(sources(c) for c in build_cells() if c["cell_type"] == "code")
     assert "tahmindir" in parameters
     assert "hangi terimin belirsiz" in parameters
+
+
+def test_the_install_cell_drops_the_module_cache_before_importing() -> None:
+    """Re-running the notebook must not train on the code from the previous run.
+
+    ``import`` serves ``sys.modules`` first, so a re-run in a live Colab kernel
+    keeps the *old* ``train.py`` even though the pull succeeded. Measured: after a
+    pull, ``import`` still returns the previous revision. The visible symptom is
+    the worst kind -- the memory budget looks right in the cell, the 40 GB
+    guarantee is already gone, and the run OOMs at 8192 exactly as before.
+    """
+    install = sources(install_cell())
+    assert "importlib.invalidate_caches()" in install, "bytecode caches are separate"
+    assert 'startswith("gotooltrain.")' in install, "the whole package must go, not just the root"
+    assert "del sys.modules[_name]" in install
+
+
+def test_the_cache_is_dropped_before_the_import_not_after_it() -> None:
+    """Ordering is the whole fix, and it is the part a later edit would break.
+
+    Cleaning up *after* the import looks identical in a diff and leaves the stale
+    module in place. Verified end to end on a real repository: without the cleanup
+    a re-run keeps the old module after the pull, and with it the new one loads.
+    """
+    install = sources(install_cell())
+    cleanup = install.index("importlib.invalidate_caches()")
+    imported = install.index("import gotooltrain")
+    assert cleanup < imported, "the import is served from the cache the cleanup is meant to clear"
+
+
+def test_the_install_cell_checks_the_code_can_do_what_this_run_needs() -> None:
+    """Right path is not right code.
+
+    Pinning ``REPO_REF`` at an old revision used to fail hours later, as an OOM.
+    The capability check turns that into a message in the cell that failed.
+    """
+    install = sources(install_cell())
+    for symbol in ("enter_training_mode", "completion_only_loss", "DEFAULT_MEMORY_BUDGET_GB"):
+        assert symbol in install, f"{symbol} is what makes the 40 GB budget mean anything"
+    assert "yeteneekler" in install or "yetenekler" in install
+
+
+def test_the_run_cell_names_the_stale_plan_trap_before_it_bites() -> None:
+    """A re-run after a failed run hits a refusal, and the notebook says so.
+
+    The refusal is correct -- a plan is a record of what a run was -- so the fix is
+    to tell the reader the one command that clears it.
+    """
+    run_cell = "\n".join(c for c in code_cells() if "training_plan" in c)
+    assert run_cell, "the run cell must discuss the plan file it writes"
+    assert "rm -rf runs/colab-sft" in run_cell
+    assert "training_plan.json" in run_cell
 
 
 def test_the_reader_is_told_to_check_that_checkpointing_actually_fired() -> None:
