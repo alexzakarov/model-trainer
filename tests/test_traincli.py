@@ -16,6 +16,7 @@ import pytest
 
 from gotooltrain.dataset import write_jsonl
 from gotooltrain.gotools import GO_TOOLS
+from gotooltrain.train import RunSummary
 from gotooltrain.traincli import main
 
 TOOLS = [tool.to_openai() for tool in GO_TOOLS]
@@ -221,6 +222,68 @@ def test_an_sft_run_trains_and_writes_a_checkpoint(
     assert summary["steps"] == 1
     assert summary["supervised_tokens"] > 0
     assert (tmp_path / "out" / "config.json").is_file()
+
+
+def test_the_cli_reports_each_step_while_the_run_is_still_going(
+    tiny_checkpoint: pathlib.Path,
+    qwen_tokenizer: Any,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run that says nothing until it finishes is indistinguishable from a hung one.
+
+    The first Colab run trained for hours with no step count, no loss, and no line
+    confirming that gradient checkpointing had fired, because the log callback
+    appended to a list and the list was printed after ``train`` returned. So the
+    one thing worth watching -- whether the first step fits in 40 GB -- was exactly
+    what was withheld. This asserts the line is on stderr *during* the call, which
+    is what the deferred version cannot do.
+    """
+    import gotooltrain.traincli as cli
+
+    monkeypatch.setattr(cli, "_tokenizer", lambda name: qwen_tokenizer)
+    seen_during_training: list[str] = []
+
+    def spy(plan: Any, examples: Any, device: str = "cpu", log: Any = None) -> Any:
+        assert log is not None, "the run must be given somewhere to report progress"
+        log("adım 1/1 loss 1.0000")
+        seen_during_training.append(capsys.readouterr().err)
+        return RunSummary(
+            steps=1,
+            epochs=1,
+            examples=len(examples),
+            supervised_tokens=1,
+            final_loss=1.0,
+            duration_s=0.0,
+            plan_path="out/training_plan.json",
+        )
+
+    monkeypatch.setattr(cli, "train", spy)
+    assert main(sft_args(tmp_path, tiny_checkpoint, dataset(tmp_path))) == 0
+
+    assert seen_during_training, "train was never called"
+    assert "adım 1/1" in seen_during_training[0], (
+        "the step line was not on stderr while the run was still going: "
+        f"deferred output, saw {seen_during_training[0]!r}"
+    )
+
+
+def test_progress_goes_to_stderr_so_the_summary_stays_pipeable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One stream for the human, one for the machine.
+
+    stdout is the JSON record, so ``traincli ... | jq`` keeps working while the log
+    scrolls past on the terminal. Sending progress to stdout as well would corrupt
+    every caller that parses the summary.
+    """
+    from gotooltrain.traincli import _progress
+
+    _progress("bir adım")
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "bir adım"
+    assert captured.out == "", "progress must not touch stdout"
 
 
 def test_a_dpo_run_trains_and_writes_a_checkpoint(

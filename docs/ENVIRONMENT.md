@@ -92,8 +92,8 @@ make check
 ```
 
 ```
-pytest + coverage : 1013 passed, 22 skipped (Docker'suz Windows) / 1033 (hepsi kurulu)
-coverage          : %100 statement + branch (3697 satır, 1012 dal)
+pytest + coverage : 1015 passed, 22 skipped (Docker'suz Windows) / 1035 (hepsi kurulu)
+coverage          : %100 statement + branch (3693 satır, 1008 dal)
 ruff check        : temiz
 ruff format       : 72 dosya hazır
 mypy              : 29 dosyada hatasız

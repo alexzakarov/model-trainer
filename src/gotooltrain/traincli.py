@@ -216,6 +216,22 @@ def _load_conversations(path: str) -> list[Any]:
     return conversations
 
 
+def _progress(message: str) -> None:
+    """Report progress as it happens, on stderr, one line at a time.
+
+    Collecting these into a list and printing them after the run returns meant an
+    hours-long training job showed *nothing* until it finished: no step count, no
+    loss, no line confirming that gradient checkpointing had actually fired. From
+    outside the run looked hung, and the one thing worth watching -- whether the
+    first step fits in 40 GB -- was the thing being withheld. The first Colab run
+    spent that way; the fix is not buffering, it is ordering.
+
+    stderr, not stdout: stdout carries the machine-readable summary, so a caller
+    can pipe it into ``jq`` while a human watches the log.
+    """
+    print(message, file=sys.stderr, flush=True)
+
+
 def cmd_sft(args: argparse.Namespace) -> int:
     """Fine-tune on a mined corpus, refusing anything that would train on nothing."""
     tokenizer = _tokenizer(args.tokenizer)
@@ -236,10 +252,7 @@ def cmd_sft(args: argparse.Namespace) -> int:
     # trainer all carry supervised tokens. No second check here: an unreachable
     # guard is a claim that cannot be tested, and this project tests everything.
     plan = _plan(args)
-    lines: list[str] = []
-    summary = train(plan, examples, device=args.device, log=lines.append)
-    for line in lines:
-        print(line, file=sys.stderr)
+    summary = train(plan, examples, device=args.device, log=_progress)
     print(json.dumps(summary.to_record(), indent=2, sort_keys=True))
     return 0
 
@@ -252,7 +265,6 @@ def cmd_dpo(args: argparse.Namespace) -> int:
         raise ToolTrainError(f"no preference pairs in {args.pairs}")
 
     plan = _plan(args)
-    lines: list[str] = []
     summary = train_dpo(
         plan,
         pairs,
@@ -260,10 +272,8 @@ def cmd_dpo(args: argparse.Namespace) -> int:
         tool_specs=[tool.to_openai() for tool in GO_TOOLS],
         beta=args.beta,
         device=args.device,
-        log=lines.append,
+        log=_progress,
     )
-    for line in lines:
-        print(line, file=sys.stderr)
     print(json.dumps(summary.to_record(), indent=2, sort_keys=True))
     return 0
 

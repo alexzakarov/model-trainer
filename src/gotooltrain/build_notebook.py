@@ -448,7 +448,6 @@ for _name in [n for n in list(sys.modules) if n == "gotooltrain" or n.startswith
 importlib.invalidate_caches()
 
 import gotooltrain  # noqa: E402
-from gotooltrain.train import completion_only_loss, enter_training_mode  # noqa: E402
 
 print("gotooltrain:", gotooltrain.__version__, "->", gotooltrain.__file__)
 
@@ -460,19 +459,32 @@ if not gotooltrain.__file__.startswith(target):
         "Sistemde başka bir kurulum var ve eğitimi yanlış kodla yapacağız."
     )
 
-# Yol doğruysa bu artık *çekilen* kod. Yine de koşunun bağlı olduğu yetenekler
-# gerçekten var mı diye bakılıyor. `REPO_REF`'i eski bir revizyona sabitlemişsen
-# koşu iki saat sonra OOM ederek değil, burada açık bir mesajla durur. "Not
-# defteri çalıştı" ile "koşunun istediği kodla çalıştı" aynı şey değil.
-_yetenekler = ("enter_training_mode", "completion_only_loss", "DEFAULT_MEMORY_BUDGET_GB")
-_eksik = [n for n in _yetenekler if not hasattr(gotooltrain.train, n)]
-if _eksik:
-    raise SystemExit(
-        f"{REPO_REF} revizyonu bu koşunun ihtiyaç duyduğu yeteneklerden yoksun: "
-        f"{', '.join(_eksik)}. Bellek bütçesinin işe yaraması bunlar olmadan "
-        "mümkün değil; yeni bir revizyona sabitle ya da Runtime'ı yeniden başlat."
+# Koşunun ihtiyaç duyduğu yetenekler gerçekten var mı? Kontrolün kendisi
+# import: burada hata veren bir koşu zaten yapamayacağı bir şeyi denemeye
+# çalışıyordu, ve iki saat sonra OOM olarak dönecekti. `REPO_REF` eski bir
+# revizyona sabitlenmişse koşu burada, açık bir mesajla durur.
+#
+# `from ... import` bilinçli seçildi: `gotooltrain.train` bir *fonksiyon* adıyla
+# da var (paket `train` işlevini dışa aktarıyor) ve modülü gölgeliyor. Ölçtüm:
+# `hasattr(gotooltrain.train, ...)` üç yeteneğin de False'unu veriyor, `import
+# ... as` da fonksiyonu bağlıyor. Yani ilk yazdığım kontrol, elindeki kod
+# doğru olsa bile "eksik" diyordu — doğru bir koşuyu durdurup hatayı koda
+# yazıyordu. from-import modülü sys.modules üzerinden çözer, gölgelenmez.
+try:
+    # Kullanılmıyorlar; buradaki import'un kendisi sözleşme. noqa: F401.
+    from gotooltrain.train import (  # noqa: E402, F401
+        DEFAULT_MEMORY_BUDGET_GB,
+        completion_only_loss,
+        enter_training_mode,
     )
-print("40 GB koşusunun ihtiyaç duyduğu yetenekler: tamam")
+except ImportError as _exc:
+    raise SystemExit(
+        f"{REPO_REF} revizyonu bu koşunun ihtiyaç duyduğu yeteneklerden yoksun "
+        f"({_exc.name}). Bellek bütçesinin işe yaraması bunlar olmadan mümkün "
+        "değil; yeni bir revizyona sabitle ya da Runtime'ı yeniden başlat."
+    ) from _exc
+print(f"40 GB koşusunun yetenekleri: tamam (bütçe {DEFAULT_MEMORY_BUDGET_GB:.0f} GB)")
+
 """
         ),
         _toolchain_cell(),
@@ -733,7 +745,14 @@ with open("data/sft.jsonl", "w", encoding="utf-8", newline="\\n") as handle:
 print(f"data/sft.jsonl yazıldı: {len(kept)} kayıt (mesaj biçimi)")
 
 command = [
-    sys.executable, "-m", "gotooltrain.traincli", "sft",
+    # `-u` şart, göze çarpmayan bir ayrıntı değil: alt sürecin stdout'u buraya
+    # *boru* olarak bağlanıyor ve Python, boruya yazarken satır değil 8 KB blokta
+    # tamponluyor. Yani `print()`'ler 8 KB birikene kadar **görünmez**. stderr
+    # ise her zaman satır tamponlu — bu yüzden ilk koşuda yalnızca tqdm ve
+    # transformers uyarıları göründü, bellek bütçesi ve adım sayacı hiç görünmedi;
+    # ekran "takıldı" gibi görünüyordu, koşu ise çalışıyordu. `-u` ikisini de
+    # tamponlamaz.
+    sys.executable, "-u", "-m", "gotooltrain.traincli", "sft",
     "--model", MODEL_ID,
     "--output", OUTPUT,
     "--tokenizer", MODEL_ID,
