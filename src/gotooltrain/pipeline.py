@@ -363,6 +363,37 @@ def measure_dataset(
     }
 
 
+def _check_token(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
+    """Refuse a publishing run without a token, before anything is downloaded.
+
+    The trainer already refuses on a missing token before it loads the model, which is
+    the expensive part -- but by then the corpus has been fetched and measured. A
+    token is knowable in the first second, so it is checked in the first second.
+
+    Only a run that publishes needs one: with no ``--hub-repo-id``, or with
+    ``--hub-dry-run``, the environment is never asked for it.
+    """
+    import os
+
+    extras = [*options.extra_sft, *options.extra_dpo]
+    if "--hub-repo-id" not in extras:
+        emit("token: no Hub publication configured, so none is needed")
+        return 0
+    if "--hub-dry-run" in extras:
+        emit("token: --hub-dry-run is set, so the upload is rehearsed and no token is needed")
+        return 0
+    if not os.environ.get("HF_TOKEN"):
+        raise DatasetError(
+            "HF_TOKEN is not set, and this run publishes to the Hugging Face Hub. Set "
+            "it before the run starts -- as a Colab secret, or in the environment -- or "
+            "pass --hub-dry-run to rehearse the schedule without uploading. Finding "
+            "this out after the corpus download is minutes spent on a run that could "
+            "not have finished."
+        )
+    emit("token: HF_TOKEN is set")
+    return 0
+
+
 def _check_device(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
     """Fail in seconds if the card cannot hold the run.
 
@@ -436,6 +467,17 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                 "device",
                 ("in-process", "is there a card that can hold this run"),
                 run=lambda emit: _check_device(options, emit),
+            )
+        )
+
+    # A token is knowable in the first second; the download is not. Checking it next
+    # means an unset HF_TOKEN costs seconds rather than a corpus fetch.
+    if options.run_token_check:
+        stages.append(
+            Stage(
+                "token",
+                ("in-process", "is there a token, if this run publishes"),
+                run=lambda emit: _check_token(options, emit),
             )
         )
 
@@ -756,6 +798,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-gate", action="store_true")
     parser.add_argument("--no-corpus", action="store_true")
     parser.add_argument("--no-device", action="store_true")
+    parser.add_argument("--no-token", action="store_true")
     parser.add_argument("--no-data", action="store_true")
     parser.add_argument("--no-sft", action="store_true")
     parser.add_argument("--no-eval", action="store_true")
@@ -776,6 +819,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_gate=not args.no_gate,
         run_corpus=not args.no_corpus,
         run_device_check=not args.no_device,
+        run_token_check=not args.no_token,
         run_data=not args.no_data,
         run_sft=not args.no_sft,
         run_eval=not args.no_eval,

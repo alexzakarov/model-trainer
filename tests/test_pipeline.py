@@ -192,6 +192,7 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         extra_dpo=[],
         run_gate=True,
         run_device_check=True,
+        run_token_check=True,
         run_corpus=True,
         run_data=True,
         run_sft=True,
@@ -364,6 +365,61 @@ def test_a_host_without_torch_skips_the_card_check_rather_than_failing(
     assert any("torch not installed" in line for line in lines), lines
 
 
+def test_a_publishing_run_without_a_token_is_refused_before_the_download(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The token is knowable in the first second; the corpus is not.
+
+    The trainer already refuses on a missing token before it loads the model, but by
+    then the corpus has been fetched and measured. Measured for real: a run with the
+    secret present in the Colab panel still stopped at the training stage, because
+    nothing had put it in the process environment -- and the check that would have
+    said so in the first second did not exist.
+    """
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    lines: list[str] = []
+    with pytest.raises(DatasetError, match="HF_TOKEN is not set"):
+        pipe._check_token(options(tmp_path, extra_sft=["--hub-repo-id", "a/b"]), lines.append)
+
+    names = [stage.name for stage in pipe.build_stages(options(tmp_path))]
+    assert names.index("token") < names.index("corpus"), names
+
+
+def test_a_run_that_does_not_publish_needs_no_token(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Asking for a credential a run never uses is how people learn to ignore checks."""
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    lines: list[str] = []
+    assert pipe._check_token(options(tmp_path), lines.append) == 0
+    assert any("none is needed" in line for line in lines), lines
+
+
+def test_a_rehearsal_needs_no_token_even_with_a_repo_named(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rehearsal uploads nothing, so it must not demand the credential uploading needs."""
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    lines: list[str] = []
+    code = pipe._check_token(
+        options(tmp_path, extra_sft=["--hub-repo-id", "a/b", "--hub-dry-run"]), lines.append
+    )
+    assert code == 0
+    assert any("rehearsed" in line for line in lines), lines
+
+
+def test_a_token_that_is_present_is_reported_not_echoed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A check that prints the secret it found has moved it into a notebook output."""
+    monkeypatch.setenv("HF_TOKEN", "hf_this_must_not_be_printed")
+    lines: list[str] = []
+    assert (
+        pipe._check_token(options(tmp_path, extra_sft=["--hub-repo-id", "a/b"]), lines.append) == 0
+    )
+    assert not any("hf_this_must_not_be_printed" in line for line in lines), lines
+
+
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:
     """Each stage consumes what the one before it produced.
 
@@ -376,6 +432,7 @@ def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.
     names = [stage.name for stage in pipe.build_stages(options(tmp_path))]
     assert names == [
         "device",
+        "token",
         "quality-gate",
         "corpus",
         "sft-data",
@@ -395,7 +452,7 @@ def test_a_switched_off_stage_disappears_from_the_chain(tmp_path: pathlib.Path) 
     names = [
         stage.name for stage in pipe.build_stages(options(tmp_path, run_eval=False, run_dpo=False))
     ]
-    assert names == ["device", "quality-gate", "corpus", "sft-data", "sft"]
+    assert names == ["device", "token", "quality-gate", "corpus", "sft-data", "sft"]
     assert not any("eval" in name or "dpo" in name or name == "preferences" for name in names)
 
 
@@ -799,6 +856,7 @@ def test_selecting_nothing_is_reported_rather_than_silently_succeeding(
         pipe.main(
             [
                 "--no-device",
+                "--no-token",
                 "--no-gate",
                 "--no-corpus",
                 "--no-data",

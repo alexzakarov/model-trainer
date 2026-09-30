@@ -610,9 +610,46 @@ print(f"40 GB koşusunun yetenekleri: tamam (bütçe {DEFAULT_MEMORY_BUDGET_GB:.
 # ustune eklenir. Yayinlar PUSH_EVERY adimda birer olur.
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
+
+# ---------------------------------------------------------------- token
+#
+# Secret'ı Colab panelinde tutmak ile sürecin **ortamında** tutmak aynı şey değil.
+# Yayınlayıcı `HF_TOKEN` ortam değişkenini okur; secrets panelindeki kayıt, ona
+# dokunulmadıkça orada görünmez. Bu yüzden okunup ortama konur.
+#
+# Ölçüldü: panelde token varken alt süreç "$HF_TOKEN is not set" verdi. Eksik olan
+# token değil, onu okuyan satırdı.
+#
+# Sıra önemli: bu kontrol boru hattının **ilk** aşamasına denk düşüyor, yani korpus
+# indirilmeden önce. Token'ı indirmeden sonra öğrenmek, bitmeyecek bir koşuya
+# dakikalar harcamak demek.
+try:
+    from google.colab import userdata
+
+    _secret = userdata.get("HF_TOKEN")
+    if _secret:
+        HF_TOKEN = _secret
+        print("HF_TOKEN: Colab secret'tan okundu")
+except Exception as _exc:  # noqa: BLE001 - Colab dışında da çalışmalı
+    print(f"Colab secret okunamadı ({type(_exc).__name__}); 1. hücredeki değer kullanılacak")
+
+_placeholder = "hf_mock_replace_me"
+if HF_TOKEN and HF_TOKEN != _placeholder:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    print(f"HF_TOKEN ortama kondu ({HF_TOKEN[:7]}..., {len(HF_TOKEN)} karakter)")
+elif DRY_RUN:
+    os.environ["HF_TOKEN"] = "hf_mock_dry_run"
+    print("DRY_RUN=True: gerçek bir token gerekmiyor")
+else:
+    raise SystemExit(
+        "HF_TOKEN yok. Sol panelden 🔑 Secrets'a `HF_TOKEN` ekle (yazma yetkisi olan "
+        "bir token), ya da 1. hücredeki HF_TOKEN'a değerini yaz. Kuru prova için "
+        "DRY_RUN=True yap. Bu kontrol korpus indirilmeden önce çalışıyor."
+    )
 
 command = [
     sys.executable, "-u", "-m", "gotooltrain.pipeline",
