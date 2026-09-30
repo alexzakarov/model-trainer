@@ -38,7 +38,7 @@ söyleyip durur** — sessizce OOM'a düşmez.
 |---|---|---|
 | 1 | Parametreler (model, repo, bağlam, `PUSH_EVERY`) | Tek yeri değiştirmen gereken yer |
 | 2 | **VRAM ön kontrolü** | 40 dakika sonra OOM öğrenmektense başta öğrenmek |
-| 3 | `git clone` + `pip install -e ".[dev,train]"` | Colab imajı değişir; sürümler burada sabitlenir |
+| 3 | `git clone` + `pip install -e ".[dev,train]"` + **çekirdek `sys.path`'i** | Colab imajı değişir; sürümler burada sabitlenir |
 | 4 | **Go + rtk**, digest'lerle doğrulanmış | Colab'da ikisi de yok — aşağıya bak |
 | 5 | Token (Colab secret ya da mock) | `HF_TOKEN` yoksa **başlamadan** hata |
 | 6 | **Kalite kapısı**: `pytest -q -x -rs` | Kırık ağaca kanat takmadan önce ~2 dk test |
@@ -86,6 +86,33 @@ kurulup sürece aktarılmayan bir Go, kapıdan geçer ve eğitimde patlar.
 Mimari kontrolü de var: sabitlenmiş build'ler x86_64, Colab'ın T4/L4/A100
 runtime'ları da öyle. Başka bir mimaride hücre adıyla duruyor.
 
+## Hücre 3'ün `sys.path` satırı neden var
+
+`pip install -e` yalnızca **yeni** süreçlerde görünür. `.pth` ve
+editable-finder çengelleri yorumlayıcı **başlangıcında** kurulur; Colab çekirdeği
+ise bu hücreden çok önce başlamıştır.
+
+Bunu tahmin etmedim, ölçtüm: pip'i çalıştıran yorumlayıcı, kendi kurduğu paketi
+import edemiyor. Asimetri şu:
+
+| | gotooltrain görür mü |
+|---|---|
+| Alt süreç (kalite kapısı, eğitim koşusu) | ✅ evet — kurulumdan sonra doğar |
+| Colab çekirdeği | ❌ hayır — kurulumdan önce doğdu |
+
+Sonuç tam olarak bildirilen hataydır: 6. hücre (kapı) yeşil, 8. hücre
+`ModuleNotFoundError`. Kurulum **hücre 3'te**, hata **hücre 8'de** — arada
+dört hücre.
+
+Bu yüzden 3. hücre kaynak dizini çekirdeğin `sys.path`'ine de ekler ve
+paketi hemen import ederek **doğrular**. Gizli bir düşüş değil: kurulum zaten
+yapıldı, bu yalnızca aynı kurulumu *bu* sürece görünür kılıyor. Konsol
+betikleri (`gotooltrain-train`) alt süreçlerde çalışır ve zaten yolunu bulur.
+
+Doğrulama iki şeyi birden kontrol eder: import gerçekten çalışıyor ve cevap
+veren kop **klonun kendisi**. `sys.path`'te başka bir `gotooltrain` varsa
+(sık görülen tuzak: daha önce kurulmuş bir sürüm) defter onu sessizce eğitirdi;
+şimdi adıyla duruyor.
 ## Periyodik yayınlama
 
 ```bash

@@ -385,6 +385,33 @@ run(sys.executable, "-m", "pip", "install", "-q", "-e", f"{target}[dev,train]")
 
 os.chdir(target)
 print("cwd:", os.getcwd())
+
+# ---------------------------------------------------------------- kernel path
+#
+# `pip install -e` yalnızca *yeni* süreçlerde görünür. .pth ve editable-finder
+# çengelleri yorumlayıcı **başlangıcında** kurulur; Colab çekirdeği ise bu
+# hücreden çok önce başlamıştır. Yani alt süreçler (kalite kapısı, eğitim koşusu)
+# paketi görür, çekirdek görmez — ve hata beş hücre sonra, başka bir hücrenin
+# satırında belirir. Burada ölçtüm: pip'i çalıştıran yorumlayıcı kendi kurduğu
+# paketi import edemiyor.
+#
+# Bu yüzden kaynak dizini çekirdeğin sys.path'ine de ekleniyor. Gizli bir
+# düşüş değil: kurulum zaten yapıldı, bu yalnızca aynı kurulumu *bu* sürece
+# görünür kılıyor. Konsol betikleri (gotooltrain-train vb.) alt süreçlerde çalışır
+# ve zaten yolunu bulur.
+sys.path.insert(0, os.path.join(target, "src"))
+
+import gotooltrain  # noqa: E402
+
+print("gotooltrain:", gotooltrain.__version__, "->", gotooltrain.__file__)
+
+# Klonun içinden geldiğini doğrula. Path'te başka bir gotooltrain varsa (sık
+# gelen bir tuzak: daha önce kurulmuş bir sürüm) sessizce onu eğitirdik.
+if not gotooltrain.__file__.startswith(target):
+    raise SystemExit(
+        f"gotooltrain {gotooltrain.__file__} konumundan geliyor, klon {target} değil. "
+        "Sistemde başka bir kurulum var ve eğitimi yanlış kodla yapacağız."
+    )
 """
         ),
         _toolchain_cell(),

@@ -274,6 +274,44 @@ def test_the_install_precedes_everything_that_needs_the_package() -> None:
     assert install < first_use
 
 
+def test_the_running_kernel_is_told_where_the_package_is() -> None:
+    """An editable install is invisible to the interpreter that performed it.
+
+    Measured, not assumed: the .pth and editable-finder hooks are registered when an
+    interpreter *starts*, so a kernel that began before the install cannot import
+    what it just installed. Every subprocess does see it -- which is why the quality
+    gate went green and the very next cell raised ``ModuleNotFoundError``. Pinning
+    the source onto ``sys.path`` is what makes the kernel agree with its children.
+    """
+    joined = "\n".join(code_cells())
+    assert 'sys.path.insert(0, os.path.join(target, "src"))' in joined
+
+
+def test_the_import_is_verified_where_it_is_installed_not_where_it_is_used() -> None:
+    """Five cells later, a missing import is a long way from its cause.
+
+    The install cell imports the package itself and refuses to continue if the clone
+    is not what answered, so a broken environment is named here rather than as a
+    ``ModuleNotFoundError`` in a cell about tokenization.
+    """
+    joined = "\n".join(code_cells())
+    install = joined.index("[dev,train]")
+    check = joined.index("import gotooltrain", install)
+    assert install < check
+    assert "gotooltrain.__file__" in joined, "the import must be checked, not merely attempted"
+    assert "raise SystemExit" in joined[check : check + 900]
+
+
+def test_a_stray_install_elsewhere_on_the_path_is_refused() -> None:
+    """A previously installed copy on sys.path is a common and silent trap.
+
+    Training the wrong copy of the code while reading the right repository is worse
+    than not training at all, and nothing else in the notebook would notice.
+    """
+    joined = "\n".join(code_cells())
+    assert "startswith(target)" in joined
+
+
 def test_a_dry_run_publishes_nothing() -> None:
     joined = "\n".join(code_cells())
     assert '"--hub-dry-run"' in joined
