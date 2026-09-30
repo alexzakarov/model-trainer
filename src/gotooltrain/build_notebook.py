@@ -112,6 +112,22 @@ RESUME_FROM = "auto"   # "auto" = repoda checkpoint varsa devam et | "" = bilere
 # denemede "başarılı/başarısız" çifti yoktur, `preferences` boş döner.
 N_SAMPLES = 4
 
+# --- boru hattı ayarları ---------------------------------------------------
+#
+# Bunlar 2. hücredeki tek komuta gider; sıra ve koşullar `pipeline.py` içinde.
+
+OPTIMIZER = "adafactor"
+SFT_OUTPUT = "runs/colab-sft"
+
+# Tercih aşaması, görev dosyası (`data/eval/tasks.jsonl`) ve ornekleme yapacak
+# çalışan bir model gerektirir. O katman kurulana kadar False: atlanan aşama
+# *atlandığını* söyler, sahte bir başarı üretmez.
+RUN_PREFERENCE_STAGE = False
+
+# Kalite kapısı her koşuda yeniden kurulmaz; dakikalar verir ve sonucu
+# değiştirmez. Kapatmak bir tercih olduğu için burada adı var.
+RUN_QUALITY_GATE = True
+
 EXPANDABLE_SEGMENTS = True               # parçalanmayı azaltır (bkz. 4. hücre)
 EPOCHS = 1
 BATCH_SIZE = 1
@@ -177,7 +193,7 @@ def _toolchain_cell() -> dict[str, Any]:
     tool was the problem.
     """
     return _code(f"""
-# @title 4 — Go ve rtk toolchain'leri
+# @title 3 — Go ve rtk toolchain'leri
 #
 # Colab'da ikisi de yok. Bu bir eksik değil, **kapının kırılma biçimi**: katalogdaki
 # komutların çoğu rtk üzerinden çalışır (`rtk go test`, `rtk read`, `rtk grep`), ve
@@ -387,37 +403,7 @@ Aşağıdaki hücre yetersiz VRAM'i sessizce geçmez — adını ve nedenini sö
         _parameters_cell(),
         _code(
             """
-# @title 2 — GPU ön kontrolü
-#
-# Yetersiz VRAM'de çalıştırmak, OOM ile 40 dakika sonra ölmekten iyidir ama yine de
-# kötüdür: ne öğrenildiği belirsiz. Adı ve gerekeni söyleyip duruyoruz.
-
-import subprocess
-
-import torch
-
-GB = 1024**3
-free = torch.cuda.is_available()
-total_gb = (torch.cuda.get_device_properties(0).total_memory / GB) if free else 0.0
-MIN_GB = 22.0  # Adafactor + gradient checkpointing + 8K bağlam için gerçek taban
-
-print(f"torch      : {torch.__version__}")
-print(f"cuda       : {free}")
-print(f"device     : {torch.cuda.get_device_name(0) if free else 'none'}")
-print(f"vram       : {total_gb:.1f} GB (gereken >= {MIN_GB:.0f} GB)")
-
-if total_gb < MIN_GB:
-    raise SystemExit(
-        f"{total_gb:.1f} GB VRAM bu tam fine-tune için yetersiz. "
-        "Runtime > Change runtime type > A100 (40 GB) seçin. "
-        "T4'de 4B tam fine-tune matematiksel olarak sığmaz; LoRA'ya düşmenin "
-        "bu projenin kararı değil, ayrı bir karar olurdu."
-    )
-"""
-        ),
-        _code(
-            """
-# @title 3 — Depoyu çek ve kur
+# @title 2 — Depoyu çek ve kur
 #
 # REF bir commit sha ise tam tekrarlanabilir olur. 'main' daha basit ama yarın
 # aynı defteri çalıştırmak farklı kod demektir.
@@ -526,662 +512,75 @@ print(f"40 GB koşusunun yetenekleri: tamam (bütçe {DEFAULT_MEMORY_BUDGET_GB:.
         _toolchain_cell(),
         _code(
             """
-# @title 5 — Token: Colab secret ya da mock
+# @title 4 — Tüm boru hattı, tek hucrede
 #
-# Proje kuralı: sessiz düşüş yok. Token yoksa yayınlama başlamadan hata verir —
-# çünkü 700 adım sonra öğrenmek, 700 adım önce öğrenmekten pahalıdır.
-
-import os
-
-try:
-    from google.colab import userdata
-
-    HF_TOKEN = userdata.get("HF_TOKEN")
-    print("HF_TOKEN: Colab secret'tan okundu")
-except (ImportError, Exception):  # noqa: B014 - colab dışında da çalışabilmeli
-    print("Colab secret yok; hücre 1'deki mock değer kullanılacak")
-
-if not HF_TOKEN or HF_TOKEN == "hf_mock_replace_me":
-    if DRY_RUN:
-        os.environ["HF_TOKEN"] = HF_TOKEN or "hf_mock_dry_run"
-        print("DRY_RUN=True: gerçek bir token gerekmiyor")
-    else:
-        raise SystemExit(
-            "HF_TOKEN yok. Sol panelden 🔑 Secrets'a HF_TOKEN ekleyin, ya da "
-            "DRY_RUN=True ile takvimi hiçbir şey yüklemeden prova edin."
-        )
-else:
-    os.environ["HF_TOKEN"] = HF_TOKEN
-
-from huggingface_hub import login
-
-login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
-print("hub client hazır")
-
-# ---------------------------------------------------------------- nereden devam
+# Buradaki tek hucre butun boru hattini calistiriyor: kalite kapisi, korpus, veri
+# olcumu, SFT, degerlendirme, tercih ciftleri, DPO. Sira, kosullar ve hata
+# durumlari `src/gotooltrain/pipeline.py` icinde; burada yalnizca ayarlar var.
 #
-# RESUME_FROM = "auto" ise karar burada veriliyor: repoda gerçek ağırlık var mı?
-# Sıfır bırakmıyorum, çünkü tahmin edilebilir taraf şu: repoda bir checkpoint
-# varsa onu devralmak, yoksa sıfırdan başlamak. Tersi, yani "sorma, sıfırdan
-# başla", mevcut olanı **silme** demek.
+# Neden tek hucre: bir defteri on bir hucreye bolmek, sirayi **okuyan kisinin
+# hafizasina** yaziyor. Bir hucre dusunce sonrakiler yine calisiyor ve hangi
+# asamanin gercekten gerceklestigi belirsizlesiyor. Burada her asamanin adi bastan
+# yazilir, ciktisi canli akar ve **bir asama basarisiz olursa boru hatti durur** --
+# yarisi calismis bir kosu, tamamlanmis gibi gorunmez.
 #
-# Kural aynı: sessiz düşüş yok. Sorgu başarısız olursa (token yok, ağ yok, repo
-# yok) bu "checkpoint yok" demek değildir — "bilmiyorum" demektir. Bilmiyorum ile
-# yok arasındaki fark, 25. adımda anlaşılır; o zaman fazla çalışmış olur.
-
-WEIGHT_FILES = {"model.safetensors", "model.safetensors.index.json", "pytorch_model.bin"}
-
-if RESUME_FROM == "auto":
-    from huggingface_hub import HfApi
-
-    try:
-        _dosyalar = set(HfApi().list_repo_files(HF_REPO_ID))
-    except Exception as _exc:  # noqa: BLE001 - her hata "bilmiyorum" demektir
-        RESUME_FROM = ""
-        print(f"\\nauto: {HF_REPO_ID} sorulamadı ({type(_exc).__name__}) — BİLMİYORUM.")
-        print("  Repoda checkpoint olabilir. Varsa ilk push onu ezecek.")
-        print(f"  Emin değilsen RESUME_FROM = \\"{HF_REPO_ID}\\" yazıp yeniden çalıştır.")
-    else:
-        if WEIGHT_FILES & _dosyalar:
-            RESUME_FROM = HF_REPO_ID
-            print(f"\\nauto: {HF_REPO_ID} içinde ağırlık var -> kaldığın yerden devam.")
-        else:
-            RESUME_FROM = ""
-            print(f"\\nauto: {HF_REPO_ID} boş (yeni repo) -> taban modelden sıfırdan.")
-elif RESUME_FROM:
-    print(f"\\ndevam: elle seçildi -> {RESUME_FROM}")
-else:
-    print("\\ndevam: yok. Bilerek sıfırdan; repoda checkpoint varsa ilk push ezecek.")
-
-"""
-        ),
-        _code(
-            """
-# @title 6 — Kalite kapısı (paket kendi testini koşar)
+# Her asamanin logu `runs/pipeline/<asama>.log` altinda. Cikti kaydirilinca teshis
+# kaybolmaz; hata olursa o asamanin son satirlari hucrede basilir.
 #
-# Colab'a kurduğumuz şeyin bu depodakiyle aynı şey olduğunu doğrulamadan 4B
-# eğitimi başlatmak, 4B eğitimi başlatmadan önce yapılabilecek en pahalı kontrolü
-# atlamak olurdu. Testler ~2 dakika sürer; 4B bir epoch saatler sürer.
+# Once `--dry-run` ile bir dene: komutlar yazilir, hicbir sey calismaz.
 #
-# -x: ilk kırıklıkta dur. Kapının amacı "bir şeyler yanlış" demek, listelemek değil.
-# Docker ve rtk testleri yoksa *atlanır* (gerekçeleri skip metninde) — bu, eksik
-# bağımlılığın sessizce yeşile dönmesi değil, açıkça raporlanmasıdır. Son satırda
-# kaç testin atlandığını ve nedenini görüyorsunuz.
+# Calisma suresi: kalite kapisi + korpus + SFT saatler; degerlendirme ve DPO bunlarin
+# ustune eklenir. Yayinlar PUSH_EVERY adimda birer olur.
 
 import subprocess
-
-started = subprocess.run(
-    [sys.executable, "-m", "pytest", "-q", "-x", "-rs"],
-    cwd=target,
-    capture_output=True,
-    text=True,
-    check=False,
-)
-print(started.stdout[-3000:])
-print(started.stderr[-2000:])
-
-skipped = [line for line in started.stdout.splitlines() if line.startswith("SKIPPED")]
-if skipped:
-    print(f"\\n--- atlanan testler ({len(skipped)}) ve gerekçeleri ---")
-    for line in skipped:
-        print(" ", line)
-
-if started.returncode != 0:
-    raise SystemExit(
-        "Kalite kapısı kırmızı. Eğitime başlamak, kırık bir ağaca kanat takmak olurdu. "
-        "Yukarıdaki çıktıya bakın. "
-        f"(Atlanan test: {len(skipped)} — bir bağımlılık eksikse bu normal; "
-        "kırmızı bir test normal değil.)"
-    )
-print("kapı yeşil")
-"""
-        ),
-        _code(
-            """
-# @title 7 — Go korpusunu indir, süz, ölç
-#
-# `go-pairs` lisans süzgecini uygular: Go-UT-Bench "permissive" diyor ama
-# terraform BUSL-1.1, go-ethereum LGPL-3.0. İkisi de varsayılan olarak reddedilir
-# ve rapora yazılır. Ayrıca split'ler örtüştüğü için tekilleştirilir.
-
-import subprocess
-
-run(
-    sys.executable, "-m", "gotooltrain.datacli", "go-pairs",
-    "--download-to", "data/go-ut-bench",
-    "--out", "data/go-dapt.jsonl",
-    "--unit-tests-out", "data/go-unit-tests.jsonl",
-    "--report", "data/go-dapt-report.json",
-)
-print(open("data/go-dapt-report.json", encoding="utf-8").read()[:1200])
-"""
-        ),
-        _code(
-            """
-# @title 8 — SFT verisini ölç, süz, doğrula
-#
-# Buradaki veri Go-UT-Bench'in *birim testi yaz* görevleridir; değerlendirme
-# trajektöri değil. Bu, yetenek ölçümü değil — format ve boru hattı denemesidir.
-# Tek turlu, araçsız, sekiz depodan biri ağırlıklı bir korpus katalogu öğretmez;
-# `measure` bunu "yetersiz" diye bildirecek ve bu doğru cevaptır. Değerlendirme
-# için konteyner havuzu, rtk ve gerçek Go depoları gerekir (docs/EVAL.md).
-#
-# **Burada token id yazmıyoruz.** Eğitim CLI'si mesajları kendisi render eder;
-# tek render yolu ilkesi budur. Buradaki iş render etmek değil **ölçmek**:
-# hangi kayıtların bağlama sığdığını ve maskenin doğru olduğunu, pahalı
-# hücrelerden önce görmek.
-#
-# Uzunluk **katalogla** ölçülüyor, çünkü eğitim CLI'sı da katalogla render edecek.
-# Katalogsuz ölçseydik altımızda kalırdı ve bağlam dışı bir kayıt eğitimi düşürürdü.
-
-import json
-
-from transformers import AutoTokenizer
-
-from gotooltrain import (
-    catalog,
-    install_template,
-    load_template_source,
-    normalize_conversation,
-    read_jsonl,
-    render_example,
-)
-
-TOOLS = catalog()
-tokenizer = install_template(AutoTokenizer.from_pretrained(MODEL_ID), load_template_source())
-print("tokenizer hazır:", type(tokenizer).__name__)
-
-records = list(read_jsonl("data/go-unit-tests.jsonl"))[:MAX_RECORDS]
-print(f"{len(records)} kayıt okundu (sınır: {MAX_RECORDS})")
-
-kept = []
-first_rendered = None
-dropped_invalid = 0
-dropped_truncated = 0
-dropped_no_supervision = 0
-total_tokens = 0
-supervised_tokens = 0
-longest = 0
-
-for record in records:
-    try:
-        conversation = normalize_conversation(record["messages"], TOOLS)
-    except Exception as exc:  # noqa: BLE001 - her ret sayılır, ilk birkaçı adlandırılır
-        dropped_invalid += 1
-        if dropped_invalid <= 3:
-            print(f"  reddedildi (geçersiz): {type(exc).__name__}: {exc}")
-        continue
-    example = render_example(tokenizer, conversation, max_length=MAX_TOKENS_PER_RECORD)
-
-    # **Tavana oturan kayıt kesilmiştir.** Kesme baştaki token'ları korur, yani
-    # asistan turn'ü sınırdan önce başladıysa *denetimli token hâlâ vardır* ve
-    # "denetim var mı" sorusu kesilmiş bir kaydı geçirir. Oysa eğitim kaydı
-    # sınırsız yeniden render eder ve `assert_examples_fit` onu bağlam dışı
-    # diye reddeder — yani ön kontrol, eğitimin reddedeceği kaydı onaylıyordu.
-    # (Ölçüldü: ilk 400 kaydın 74'ü bu durumdaydı; gerçek uzunluklar 8.5K–17.6K.)
-    if len(example.input_ids) >= MAX_TOKENS_PER_RECORD:
-        dropped_truncated += 1
-        continue
-    if example.supervised_tokens == 0:
-        # Asistan turn'üne hiç ulaşılamadı: denetlenecek bir şey yok.
-        dropped_no_supervision += 1
-        continue
-    kept.append({"messages": record["messages"], "tools": TOOLS})
-    total_tokens += len(example.input_ids)
-    supervised_tokens += example.supervised_tokens
-    longest = max(longest, len(example.input_ids))
-    if first_rendered is None:
-        first_rendered = example
-
-if not kept:
-    raise SystemExit(
-        f"{len(records)} kaydın hiçbiri kullanılabilir değil "
-        f"({dropped_truncated} kesilmiş, {dropped_no_supervision} denetimsiz, "
-        f"{dropped_invalid} geçersiz). Eğitilecek veri yok; bu koşuyu başlatmak "
-        "boşa GPU yakar."
-    )
-
-share = supervised_tokens / max(1, total_tokens)
-print(f"kabul  : {len(kept)}")
-print(
-    f"atılan: {dropped_truncated} (bağlamda kesilmiş), "
-    f"{dropped_no_supervision} (asistan turn'üne ulaşılamadı), "
-    f"{dropped_invalid} (geçersiz)"
-)
-print(f"token  : {total_tokens} toplam, {supervised_tokens} denetimli ({share:.1%})")
-average = total_tokens // len(kept)
-print(f"uzunluk: ortalama {average}, en uzun {longest} (sınır {MAX_TOKENS_PER_RECORD})")
-"""
-        ),
-        _code(
-            """
-# @title 9 — Token formatını doğrula (eğitimden ÖNCE)
-#
-# Maske bozuksa model araç çıktısı uydurmayı öğrenir ve kayıp normal görünür. Bu
-# kontrol dakikalar sürer, bir 4B epoch saatler sürer. Sıra burada.
-
-from gotooltrain import assert_mask_sane
-from gotooltrain.evalstore import sha256_text
-from gotooltrain.template import load_template_source
-
-# 8. hücrede ölçülen kayıt; eğitimin de göreceği kayıt. Render burada tekrar
-# yapılmıyor: 8. hücre zaten `first_rendered`'ı bıraktı.
-example = first_rendered
-assert_mask_sane(example)
-
-print("maske tutarlı: labels ve assistant_mask aynı yeri işaretliyor")
-print("denetimli token:", example.supervised_tokens, "/", len(example.input_ids))
-print("template sha256:", sha256_text(load_template_source())[:16])
-print("ilk 300 karakter:")
-print(tokenizer.decode(example.input_ids[:120], skip_special_tokens=False)[:300])
-"""
-        ),
-        _code(
-            """
-# @title 10 — Eğitimi başlat (periyodik Hub yüklemesiyle)
-#
-# Adafactor: ilk momenti tutmaz, ikinci momenti çarpanlaştırır. Optimizer durumu
-# birkaç GB yerine birkaç MB — tek kartta 4B'yi sığdıran şey bu.
-#
-# **--gradient-checkpointing burada belirleyici.** Bu modelde 32 katmanın 24'ü
-# Gated DeltaNet; duram [32 v_heads, 128, 128] yani token başına 1 MB. Aktivasyon
-# belleği bağlamla doğrusal büyür — tablo 8. hücrede, hesaplayan `--memory-budget-gb`.
-# Checkpointing'in etkinleşmesi için modelin *train* modunda olması gerekir
-# (`from_pretrained` eval modunda döndürür) — bu, sürümde artık düzeltildi.
-# Çalışma çıktısında "gradient checkpointing on: N module(s)" satırını **gör**;
-# yoksa bayrak hiç çalışmamış demekter.
-#
-# --hub-push-every: optimizer ADIMI sayar, batch değil. 8 kademe biriktirmeli
-# olduğu için "her batch'te gönder" demek accumulation ayarına bağımlı olurdu.
-#
-# **Bu hücreyi ikinci kez çalıştırırsan** `runs/colab-sft/training_plan.json`
-# zaten duruyor ve yeni planı reddeder: plan, koşunun ne olduğunun kaydı; üstüne
-# yazmak önceki koşunun ne olduğunu unutmak olurdu. Farklı bir plan için ya
-# `OUTPUT` dizinini değiştir ya da eski dizini **bilerek** sil:
-#
-#     !rm -rf runs/colab-sft
-#
-# Aynı parametrelerle tekrar çalıştırırsan sorun yok: plan aynı, kabul edilir.
-#
-# İlk koşuda DRY_RUN=True ile başla: pahalı hücrelerden geçer, takvimi ve
-# dosyer yazımını prova eder, tek bir bayt göndermez. Yeşil görünce DRY_RUN=False
-# yapıp yeniden çalıştır.
-
-import subprocess
-
-OUTPUT = "runs/colab-sft"
-
-with open("data/sft.jsonl", "w", encoding="utf-8", newline="\\n") as handle:
-    for row in kept:
-        handle.write(json.dumps(row) + "\\n")
-print(f"data/sft.jsonl yazıldı: {len(kept)} kayıt (mesaj biçimi)")
+import sys
 
 command = [
-    # `-u` şart, göze çarpmayan bir ayrıntı değil: alt sürecin stdout'u buraya
-    # *boru* olarak bağlanıyor ve Python, boruya yazarken satır değil 8 KB blokta
-    # tamponluyor. Yani `print()`'ler 8 KB birikene kadar **görünmez**. stderr
-    # ise her zaman satır tamponlu — bu yüzden ilk koşuda yalnızca tqdm ve
-    # transformers uyarıları göründü, bellek bütçesi ve adım sayacı hiç görünmedi;
-    # ekran "takıldı" gibi görünüyordu, koşu ise çalışıyordu. `-u` ikisini de
-    # tamponlamaz.
-    sys.executable, "-u", "-m", "gotooltrain.traincli", "sft",
+    sys.executable, "-u", "-m", "gotooltrain.pipeline",
     "--model", MODEL_ID,
-    "--output", OUTPUT,
-    "--tokenizer", MODEL_ID,
-    "--dataset", "data/sft.jsonl",
-    "--dtype", "bfloat16",
+    "--context-length", str(CONTEXT_LENGTH),
+    "--memory-budget-gb", str(MEMORY_BUDGET_GB),
+    "--optimizer", OPTIMIZER,
     "--epochs", str(EPOCHS),
     "--batch-size", str(BATCH_SIZE),
     "--grad-accum", str(GRAD_ACCUM),
-    "--lr", str(LEARNING_RATE),
-    "--max-length", str(CONTEXT_LENGTH),
-    "--memory-budget-gb", str(MEMORY_BUDGET_GB),
-    "--loss-mode", "selective",
-    "--optimizer", "adafactor",
-    "--gradient-checkpointing",
-    "--hub-repo-id", HF_REPO_ID,
-    "--hub-push-every", str(PUSH_EVERY),
+    "--learning-rate", str(LEARNING_RATE),
+    "--max-records", str(MAX_RECORDS),
+    "--sft-output", SFT_OUTPUT,
 ]
-if DRY_RUN:
-    command.append("--hub-dry-run")
+
+# Tercih zinciri, degerlendirme icin bir gorev dosyasi ve ornekleme yapacak calisan
+# bir model ister. Yoksa bu asamalar **acikca** atlanir; sahte bir basari uretilmez.
+if not RUN_PREFERENCE_STAGE:
+    command += ["--no-eval", "--no-dpo"]
+
+# Kalite kapisi her kosuda yeniden kurulmaz; tekrar etmek dakikalar verir ve
+# sonucu degistirmez. Kapatmak bir tercih, sessizce yapilmaz.
+if not RUN_QUALITY_GATE:
+    command.append("--no-gate")
+
 if RESUME_FROM:
-    command += ["--resume-from", RESUME_FROM]
+    command += ["--extra-sft", "--resume-from", RESUME_FROM]
+
+if DRY_RUN:
+    command.append("--dry-run")
+else:
+    # Kuru kosuda hicbir sey yuklenmez, bu yuzden yayin bayraklari da gonderilmez:
+    # dry-run komutu zaten hicbir sey gondermez, ama bayragi da hicbir seye yaramaz.
+    command += ["--extra-sft", "--hub-repo-id", HF_REPO_ID, "--hub-push-every", str(PUSH_EVERY)]
 
 print(" ".join(command))
 print()
-if RESUME_FROM:
-    print(f"Kaldığın yerden: ağırlıklar {RESUME_FROM}'den. Yine de sıfırdan eğitim:")
-    print("  optimizer durumu, adım sayacı ve yayın geçmişi geri gelmiyor.")
-else:
-    print(f"Kaldığın yerden devam YOK: ağırlıklar {MODEL_ID}'den, sıfırdan.")
-    if PUSH_EVERY:
-        print(
-            f"  Repoda bir checkpoint varsa {PUSH_EVERY}. adımdaki push onun üstüne yazacak. "
-            "Bunu istemiyorsan RESUME_FROM'u yukarıda doldur."
-        )
+
+result = subprocess.run(command, check=False)
 print()
-print("Bu hücre saatlerce sürebilir. Yayınlar PUSH_EVERY adımda birer olur,")
-print("böylece sekme kapanırsa kaybedilen şey en fazla PUSH_EVERY adım olur.")
-print()
-result = None
-log_path = pathlib.Path("train.log")
-with log_path.open("w", encoding="utf-8", buffering=1) as log:
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    for line in process.stdout:
-        print(line, end="")
-        log.write(line)
-    result = process.wait()
-
-print("exit:", result)
-
-# Hata, hücre çıktısında **kaybolmasın diye** ayrıca dosyadan basılıyor. Önceki
-# koşuda alt sürecin "error: ..." satırı hiç görünmedi; iki hücre sonra "hub_push.json
-# yok" diye yanlış yere baktık. Uzun bir koşunun çıktısı kaydırılınca kaybolabilir,
-# yani teşhisin tesadüfe bağlı olmaması gerekiyor.
-if result != 0:
-    out = pathlib.Path(OUTPUT)
-    if not out.is_dir():
-        cause = "Çıktı dizini hiç oluşmadı: koşu modeli yüklenmeden ya da veriyi okuyamadan durdu."
-    else:
-        listing = sorted(p.name for p in out.iterdir())
-        print(f"\\n{OUTPUT} içinde: {listing}")
-        if "training_plan.json" not in listing:
-            cause = "Plan yazılmadı: koşu başlamadan durdu."
-        elif "hub_push.json" not in listing:
-            cause = "Plan yazıldı ama bitmedi; yayınlama adımına hiç gelinmedi."
-        else:
-            cause = "Yayınladı ama hata ile bitti."
-    tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
-    print("\\n--- train.log (son 40 satır) ---")
-    for line in tail:
-        print(" ", line)
+print("Boru hatti bitti. Ozet ve loglar: runs/pipeline/")
+if result.returncode:
     raise SystemExit(
-        f"Eğitim {result} ile bitti. Yukarıdaki çıktıya bakın. {cause} "
-        "Bu hücre hatayı yutmaz: 11. hücreye geçmeden durur."
+        f"Boru hatti {result.returncode} ile durdu. Yukarida hangi asamanin ve neden "
+        "durdugu yaziyor; o asamanin logu runs/pipeline/ altinda. Bu hucre hatayi "
+        "yutmaz."
     )
-"""
-        ),
-        _code(
-            """
-# @title 11 — Ne olduğunu doğrula
-#
-# "Push ettim" demek yetmez; push'un *ne* olduğu okunmalı. Yayınlanan klasör
-# kendi kökenini taşır: hangi adım, hangi ayarlar.
-#
-# Ama önce ayrım: çıktı dizini hiç oluşmadı mı, yoksa koştu ve yayınlama adımına
-# mı gelmedi? Bu ikisi farklı hatalar ve aynı hata mesajıyla gelmez. "hub_push.json
-# yok" demek, asıl hatayı değil *sonucunu* söyler; 10. hücre artık yutmuyor ama
-# yine de teşhis burada kesinleşmeli.
-
-import json
-import pathlib
-
-from gotooltrain import read_push_state
-
-output_dir = pathlib.Path(OUTPUT)
-if not output_dir.is_dir():
-    raise SystemExit(
-        f"{output_dir} yok — eğitim hiç çıktı üretmedi, yani model yüklenmeden ya da "
-        "planı yazmadan durdu. 10. hücrenin çıktısına bakın."
-    )
-
-listing = sorted(p.name for p in output_dir.iterdir())
-print(f"{output_dir} içinde: {listing}")
-print()
-
-state = read_push_state(output_dir)
-print(f"step {state['step']}/{state['total_steps']}")
-plan_record = state["plan"]
-for key in (
-    "model_id",
-    "learning_rate",
-    "epochs",
-    "context_length",
-    "optimizer",
-    "token_format",
-    "gradient_checkpointing",
-):
-    print(f"  {key:22} {plan_record[key]}")
-print(f"  {'hub':22} {plan_record['hub']}")
-
-if not DRY_RUN:
-    from huggingface_hub import HfApi
-
-    api = HfApi()
-    files = api.list_repo_files(HF_REPO_ID)
-    print(f"\\n{HF_REPO_ID} içinde {len(files)} dosya:")
-    for name in sorted(files)[:15]:
-        print("  ", name)
-    print("\\ngit log gibi: her push bir commit. Adım commit mesajında.")
-
-    # Depoda zaten eğitilmiş bir model varsa, iki seçenek var ve ikisi de
-    # sessiz değil: ya o ağırlıklarla devam edersin, ya da sıfırdan başlayıp
-    # üzerine yazarsın. Kararı okuyana bırakmak, "nereye yazıyoruz" sorusunu
-    # cevapsız bırakmaktan iyi.
-    WEIGHTS = {"model.safetensors", "model.safetensors.index.json", "pytorch_model.bin"}
-    if WEIGHTS & set(files) and not RESUME_FROM:
-        print(
-            "\\n  DIKKAT: repoda eğitilmiş bir checkpoint var, ama RESUME_FROM boş."
-        )
-        print(
-            "  Bu koşu taban modelden başlayacak ve ilk push'ta o checkpoint'in"
-        )
-        print(
-            f"  UZERINE yazacak. Devam etmek istiyorsan 1. hücrede"
-        )
-        print(f'    RESUME_FROM = "{HF_REPO_ID}"')
-        print("  yazıp 10. hücreyi yeniden çalıştır.")
-else:
-    print("\\nDRY_RUN=True idi: hiçbir şey gönderilmedi. Yukarıdaki 'pushed step'")
-    print("satırlarını 10. hücrede görmüş olmalısınız. Şimdi DRY_RUN=False yapıp")
-    print("yeniden çalıştırın.")
-"""
-        ),
-        _code(
-            """
-# @title 12 — DPO hazırlığı: SFT çıktısını sun
-#
-# Tercih optimizasyonu örnek ister, ve örnekler **koşan bir modelden** gelmek
-# zorundadır: aynı görevin birden çok denemesi, biri doğrulanırken biri
-# başarısız olduğunda "tercih" doğar. Tek deneme varsa karşılaştırma yoktur.
-#
-# Bu yüzden 10. hücredeki SFT çıktısını bir OpenAI uyumlu uca sunuyoruz. Kaynak
-# model değil, **eğitilmiş** checkpoint: RESUME_FROM'un tersi. SFT'in yazdığı
-# `runs/colab-sft` klasörü doğrudan kullanılır; ayrıca indirmeye gerek yok.
-#
-# vLLM ayrı bir süreç: GPU'yu bu hücre değil, o süreç tutar. Bu yüzden DPO
-# koşusundan önce kapatılmalı — aynı anda iki model GPU'da olursa bütçe yanlış
-# hesaplanır. `pkill` satırı DPO hücresinde.
-
-import pathlib
-import subprocess
-import sys
-import time
-import urllib.error
-import urllib.request
-
-SFT_DIR = pathlib.Path(OUTPUT)
-if not (SFT_DIR / "config.json").is_file():
-    raise SystemExit(
-        f"{SFT_DIR} bir kontrol noktası değil (config.json yok). 10. hücreyi önce "
-        "çalıştır; tercih optimizasyonu SFT'in üstüne kurulur, yanına değil."
-    )
-
-run = sys.executable, "-m", "pip", "install", "-q", "vllm"
-subprocess.run(run, check=True)
-
-VLLM_PORT = 8000
-VLLM_LOG = "vllm.log"
-MODEL_URL = f"http://127.0.0.1:{VLLM_PORT}/v1"
-# gpu_memory_utilization düşük tutuluyor: sunucu kendi ağırlıklarını + KV
-# önbelleğini bu yüzdeyle ayırıyor ve kalanı başka bir şeye ait. 0.85, kartın
-# geri kalanına başka bir iş bırakacak kadar az.
-server = subprocess.Popen(
-    [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", str(SFT_DIR),
-        "--port", str(VLLM_PORT),
-        "--gpu-memory-utilization", "0.85",
-        "--max-model-len", str(CONTEXT_LENGTH),
-        "--served-model-name", "policy",
-    ],
-    # Log dosyasına, çöpe değil. İlk denemede stdout DEVNULL'a gitti ve hata
-    # "yukarıdaki çıktıya bak" dedi — gösterdiği şeyi ben söndürmüştüm. Sunucu
-    # başarısız olduğunda teşhis tek yerde durur ve hücre onu basar.
-    stdout=open(VLLM_LOG, "w", buffering=1),
-    stderr=subprocess.STDOUT,
-)
-
-
-def vllm_tail(lines: int = 30) -> str:
-    # Buraya bir docstring konabilirdi; hücre metni zaten üç tırnakla çevrili,
-    # içeride üç tırnak onu bitirir. Aynı tuzağa ikinci kez düşmemek için yorum.
-    try:
-        return "\\n".join(pathlib.Path(VLLM_LOG).read_text(errors="replace").splitlines()[-lines:])
-    except OSError:
-        return "(log okunamadı)"
-
-
-print(f"vLLM başlatıldı (pid {server.pid}), log: {VLLM_LOG}")
-print(f"{MODEL_URL} bekleniyor...")
-deadline = time.monotonic() + 900
-last_report = 0.0
-while time.monotonic() < deadline:
-    if server.poll() is not None:
-        print(f"\\n--- {VLLM_LOG} (son 30 satır) ---")
-        print(vllm_tail())
-        raise SystemExit(
-            f"vLLM {server.returncode} ile ayrıldı. Sebebi yukarıda. Sunucu ayakta "
-            "olmadan DPO örnek üretemez; en olası nedenler: bu vLLM sürümü "
-            "qwen3_5'i desteklemiyor, ya da --max-model-len kartın KV önbelleğine "
-            "sığmıyor."
-        )
-    try:
-        with urllib.request.urlopen(f"{MODEL_URL}/models", timeout=2) as response:
-            print("hazır:", response.read().decode()[:200])
-            break
-    except (urllib.error.URLError, TimeoutError, OSError):
-        # Bir model yüklemesi dakikalar sürer ve sessizdir; "takıldı" ile
-        # "yükleniyor" ayrımı ilerleme basılmadan yapılamıyor.
-        if time.monotonic() - last_report > 30:
-            last_report = time.monotonic()
-            print(f"  ...yükleniyor (log son satır: {vllm_tail(1).strip()[:120]})")
-        time.sleep(5)
-else:
-    server.terminate()
-    print(f"\\n--- {VLLM_LOG} (son 30 satır) ---")
-    print(vllm_tail())
-    raise SystemExit("vLLM 15 dakikada hazır olmadı. Kart dolu olabilir; sunucu öldürüldü.")
-"""
-        ),
-        _code(
-            """
-# @title 13 — Tercih çiftleri, sonra DPO
-#
-# Zincir: **çalıştır -> doğrula -> çift çıkar -> DPO**. Örnek üretimi burada değil,
-# 12. hücredeki sunucudan; burada olan `evalcli queue` -> `judge` -> `preferences`.
-#
-# Önce dürüst olmayı gerektiren bir gerçek var: **görev dosyası bu depoda yok.**
-# Go-UT-Bench `(depo, dosya, kod)` veriyor; değerlendirme ise her görevin kendi
-# `verification` komutunu ve çalışacak bir fixture deposunu bildirmesini istiyor
-# (`src/gotooltrain/tasks.py`). O katman kurulmadan çift üretilemez — çünkü
-# "başarılı" demek, bir testin geçmesi demek.
-#
-# Bu yüzden hücre, dosya yoksa **adıyla durur**. Sıfır çift üretip "başarılı" yapan
-# bir hücre, DPO'nun çalıştığını sandırtır; oysa hiçbir şey karşılaştırılmamıştır.
-# Dosyayı hazırladıktan sonra TASKS_FILE'ı göster, hücreyi yeniden çalıştır.
-
-import json
-import os
-import pathlib
-import signal
-import subprocess
-import sys
-
-TASKS_FILE = pathlib.Path("data/eval/tasks.jsonl")
-EVAL_STORE = pathlib.Path("runs/eval-store")
-DPO_OUTPUT = "runs/colab-dpo"
-
-if not TASKS_FILE.is_file():
-    print(f"görev dosyası yok: {TASKS_FILE}")
-    print()
-    print("Tercih optimizasyonu için gereken şey:")
-    print("  1) her görevde çalıştırılabilir bir 'verification' komutu")
-    print("  2) çalışacak bir fixture deposu (dosyanın *gerçek* hali)")
-    print("  3) --n-samples > 1: tek deneme karşılaştırma üretmez")
-    print()
-    print("Go-UT-Bench yalnızca (depo, dosya, kod) verir; o katman")
-    print("src/gotooltrain/tasks.py'nin işidir ve docs/EVAL.md'de anlatılır.")
-    raise SystemExit(
-        "Görev dosyası olmadan tercih çifti üretilemez. Bu hata değil, eksik girdi — "
-        "ama DPO'yu 'çalıştı' saymak için sahte bir çift üretmek daha kötü olurdu."
-    )
-
-# DPO iki modeli GPU'da tutar (policy + donmuş referans). vLLM hâlâ ayakta ise
-# bütçe hesabı yanlış olur ve koşu, açıklama yerine ham bir OOM atar.
-subprocess.run(["pkill", "-f", "vllm.entrypoints"], check=False)
-print("vLLM kapatıldı; DPO iki modeli de bu kartta tutacak.")
-
-# --- örnekleri topla -------------------------------------------------------
-common = [
-    "--store", str(EVAL_STORE), "--tasks", str(TASKS_FILE),
-    "--model", "policy", "--revision", f"sft-{CONTEXT_LENGTH}",
-    "--dataset-version", "go-ut-bench-val", "--n-samples", str(N_SAMPLES),
-]
-print(f"\\n1/3 örnekler toplanıyor (her görev {N_SAMPLES} deneme)...")
-subprocess.run(
-    [sys.executable, "-m", "gotooltrain.evalcli", "queue",
-     *common, "--model-url", MODEL_URL,
-     "--sandbox", "local", "--allow-local-execution",
-     "--out", "runs/eval-queue.jsonl"],
-    check=True,
-)
-
-# --- doğrula ---------------------------------------------------------------
-# Colab'da Docker yok, bu yüzden yerel çalıştırma: modelin yazdığı Go bu
-# makinede koşar. Colab atılabilir bir VM olduğu için kabul edilebilir; kendi
-# makinende yapma.
-print("\\n2/3 doğrulama (yazılan Go çalıştırılıyor)...")
-subprocess.run(
-    [sys.executable, "-m", "gotooltrain.evalcli", "judge",
-     *common, "--queue", "runs/eval-queue.jsonl", "--verdicts", "runs/eval-verdicts.jsonl"],
-    check=True,
-)
-
-# --- çiftleri çıkar --------------------------------------------------------
-print("\\n3/3 tercih çiftleri çıkarılıyor...")
-made = subprocess.run(
-    [sys.executable, "-m", "gotooltrain.data", "preferences",
-     *common, "--out", "data/preferences.jsonl", "--report", "runs/preferences-report.json"],
-    check=False,
-)
-if made.returncode != 0:
-    print("Çift çıkmadı. Rapor: runs/preferences-report.json")
-    print("En sık sebep: --n-samples 1. Tek deneme 'başarılı/başarısız' çifti değildir.")
-    raise SystemExit(f"preferences {made.returncode} ile bitti; DPO'ya girmek yanlış olur.")
-
-# --- DPO --------------------------------------------------------------------
-# `--sandbox local` bırakılmadı: DPO çalıştırma kodunu değil, kendi ağırlıklarını
-# kullanır. İki model kopyası olduğu için bellek bütçesi iki modeli sayar; 60 GB
-# adafactor'la 16384'e kadar sığar, adamw 60 GB'a *hiç* sığmaz.
-print("\\nDPO çalışıyor...")
-subprocess.run(
-    [sys.executable, "-u", "-m", "gotooltrain.traincli", "dpo",
-     "--model", str(SFT_DIR), "--output", DPO_OUTPUT,
-     "--tokenizer", str(SFT_DIR), "--pairs", "data/preferences.jsonl",
-     "--dtype", "bfloat16", "--epochs", "1", "--batch-size", "1",
-     "--grad-accum", "4", "--lr", "5e-6", "--max-length", str(CONTEXT_LENGTH),
-     "--memory-budget-gb", str(MEMORY_BUDGET_GB), "--loss-mode", "selective",
-     "--optimizer", "adafactor", "--gradient-checkpointing",
-     "--hub-repo-id", HF_REPO_ID, "--hub-push-every", "10"],
-    check=True,
-)
 """
         ),
         _markdown(
@@ -1214,7 +613,7 @@ olurdu — o yüzden hücre adıyla durur.
   Token **oraya yazılmaz**; sadece değişkenin adı yazılır.
 - Bu bir **checkpoint**, tam bir **resume** değildir: optimizer durumu saklanmaz.
   Kaldığınız yerden devam etmek `resume_from` + yeniden eğitim demektir.
-"""
+            """
         ),
     ]
 
