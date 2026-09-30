@@ -449,6 +449,24 @@ def _check_device(options: argparse.Namespace, emit: Callable[[str], None]) -> i
     return 0
 
 
+def _module_missing(module: str) -> bool:
+    """Whether a module cannot be imported, without importing it.
+
+    ``find_spec`` does not simply return ``None`` for a module that is not there: it
+    imports the parent packages first, so ``find_spec("vllm.entrypoints...")`` raises
+    ``ModuleNotFoundError`` when ``vllm`` itself is absent. A check that treated that as
+    an error would crash inside the very branch that was supposed to report a missing
+    dependency -- measured on the first Colab run, where the quality gate caught it.
+
+    ``ValueError`` is the other way the same question fails: a name that resolves to
+    something without a ``__spec__``. Both mean "not usable here".
+    """
+    try:
+        return importlib.util.find_spec(module) is None
+    except (ImportError, ValueError):
+        return True
+
+
 def _served_module(command: Sequence[str]) -> str | None:
     """The module a ``python -m <module>`` serve command names, if it names one."""
     parts = [str(part) for part in command]
@@ -547,7 +565,7 @@ def _serve_and_generate(options: argparse.Namespace, emit: Callable[[str], None]
         # pipeline that rearranges the environment it is running in is a pipeline whose
         # failures have two possible causes. The message names the command instead.
         module = _served_module(options.serve_command)
-        if module and importlib.util.find_spec(module) is None:
+        if module and _module_missing(module):
             raise DatasetError(
                 f"the sampling stage needs `{module}`, which is not installed. Install "
                 f"it ({sys.executable} -m pip install {module.split('.')[0]}) or run with "

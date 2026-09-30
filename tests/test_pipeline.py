@@ -696,6 +696,42 @@ def test_suppressing_the_mutation_keeps_the_task_stage(tmp_path: pathlib.Path) -
     assert "tasks" in names, "suppressing the mutation must not suppress the tasks"
 
 
+def test_a_module_whose_parent_is_missing_counts_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``find_spec`` raises for a dotted name whose parent is absent.
+
+    It does not return None. The first version of this check called it directly, so on a
+    machine with no ``vllm`` it crashed with ``ModuleNotFoundError`` from inside the
+    branch that was meant to report a missing dependency. The test missed it because it
+    stubbed ``find_spec`` to return None -- testing the assumption, not the behaviour.
+    """
+
+    def raises(name: str) -> Any:
+        raise ModuleNotFoundError(f"No module named '{name.split('.')[0]}'")
+
+    monkeypatch.setattr(importlib.util, "find_spec", raises)
+    assert pipe._module_missing("vllm.entrypoints.openai.api_server") is True
+
+
+def test_a_module_without_a_spec_counts_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other way the same question fails, and it means the same thing."""
+
+    def raises(name: str) -> Any:
+        raise ValueError(f"{name}.__spec__ is None")
+
+    monkeypatch.setattr(importlib.util, "find_spec", raises)
+    assert pipe._module_missing("something.odd") is True
+
+
+def test_a_module_that_is_there_is_not_reported_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check that says "missing" for everything would refuse every run."""
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    assert pipe._module_missing("vllm") is False
+
+
 def test_a_server_that_cannot_be_imported_is_refused_before_it_is_started(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -704,8 +740,16 @@ def test_a_server_that_cannot_be_imported_is_refused_before_it_is_started(
     The install is deliberately not done from here: `pip install vllm` can move torch,
     and a pipeline that rearranges the environment it runs in is one whose failures have
     two possible causes. The message names the command instead.
+
+    The stub raises, because that is what the real ``find_spec`` does for a dotted name
+    whose parent package is absent -- returning None would be the comfortable version of
+    a function that is not comfortable.
     """
-    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+
+    def raises(name: str) -> Any:
+        raise ModuleNotFoundError(f"No module named '{name.split('.')[0]}'")
+
+    monkeypatch.setattr(importlib.util, "find_spec", raises)
     with pytest.raises(DatasetError, match="which is not installed"):
         pipe._serve_and_generate(
             options(
