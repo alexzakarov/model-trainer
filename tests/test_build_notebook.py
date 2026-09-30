@@ -356,6 +356,33 @@ def test_the_preference_stage_frees_the_gpu_before_dpo_takes_it() -> None:
     assert stage.index("pkill") < stage.index('"dpo"'), "the server goes first"
 
 
+def test_the_serving_cell_keeps_the_log_the_error_message_points_at() -> None:
+    """A failure message that points at output the cell discarded is worse than none.
+
+    This is not hypothetical: the first run of this cell sent the server's stdout to
+    DEVNULL and then said "look at the output above". The process exited 1, which is
+    the entire content of the failure, and nothing else was ever shown. The reason has
+    to be somewhere the reader can reach, so it goes to a file and the cell prints it.
+    """
+    serve = serving_cell()
+    assert "subprocess.DEVNULL" not in serve, "the diagnostic stream was thrown away"
+    assert "vllm.log" in serve, "and named, so it can be read on its own"
+    assert serve.index("vllm.log") < serve.index("vllm_tail("), "the log path comes first"
+    assert serve.count("vllm_tail()") >= 2, "both the crash and the timeout print it"
+    assert "Sebebi yukarıda" in serve, "the message points at the tail it printed"
+
+
+def test_a_model_load_that_takes_minutes_reports_progress() -> None:
+    """Loading 4B weights is silent for minutes.
+
+    Silence reads as a hang, and the reader's next move would be killing a process
+    that was in fact working.
+    """
+    serve = serving_cell()
+    assert "last_report" in serve, "waiting has to say it is waiting"
+    assert "yükleniyor" in serve
+
+
 def test_the_expensive_checks_run_before_the_expensive_step() -> None:
     """Hardware, format and the package's own suite all precede the training cell.
 

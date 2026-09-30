@@ -1017,6 +1017,7 @@ run = sys.executable, "-m", "pip", "install", "-q", "vllm"
 subprocess.run(run, check=True)
 
 VLLM_PORT = 8000
+VLLM_LOG = "vllm.log"
 MODEL_URL = f"http://127.0.0.1:{VLLM_PORT}/v1"
 # gpu_memory_utilization düşük tutuluyor: sunucu kendi ağırlıklarını + KV
 # önbelleğini bu yüzdeyle ayırıyor ve kalanı başka bir şeye ait. 0.85, kartın
@@ -1030,26 +1031,52 @@ server = subprocess.Popen(
         "--max-model-len", str(CONTEXT_LENGTH),
         "--served-model-name", "policy",
     ],
-    stdout=subprocess.DEVNULL,
+    # Log dosyasına, çöpe değil. İlk denemede stdout DEVNULL'a gitti ve hata
+    # "yukarıdaki çıktıya bak" dedi — gösterdiği şeyi ben söndürmüştüm. Sunucu
+    # başarısız olduğunda teşhis tek yerde durur ve hücre onu basar.
+    stdout=open(VLLM_LOG, "w", buffering=1),
     stderr=subprocess.STDOUT,
 )
 
-print(f"vLLM başlatıldı (pid {server.pid}), {MODEL_URL} bekleniyor...")
+
+def vllm_tail(lines: int = 30) -> str:
+    # Buraya bir docstring konabilirdi; hücre metni zaten üç tırnakla çevrili,
+    # içeride üç tırnak onu bitirir. Aynı tuzağa ikinci kez düşmemek için yorum.
+    try:
+        return "\\n".join(pathlib.Path(VLLM_LOG).read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return "(log okunamadı)"
+
+
+print(f"vLLM başlatıldı (pid {server.pid}), log: {VLLM_LOG}")
+print(f"{MODEL_URL} bekleniyor...")
 deadline = time.monotonic() + 900
+last_report = 0.0
 while time.monotonic() < deadline:
     if server.poll() is not None:
+        print(f"\\n--- {VLLM_LOG} (son 30 satır) ---")
+        print(vllm_tail())
         raise SystemExit(
-            f"vLLM {server.returncode} ile ayrıldı. Yukarıdaki hücre çıktısına bak; "
-            "sunucu başlamadan DPO örnek üretemez."
+            f"vLLM {server.returncode} ile ayrıldı. Sebebi yukarıda. Sunucu ayakta "
+            "olmadan DPO örnek üretemez; en olası nedenler: bu vLLM sürümü "
+            "qwen3_5'i desteklemiyor, ya da --max-model-len kartın KV önbelleğine "
+            "sığmıyor."
         )
     try:
         with urllib.request.urlopen(f"{MODEL_URL}/models", timeout=2) as response:
             print("hazır:", response.read().decode()[:200])
             break
     except (urllib.error.URLError, TimeoutError, OSError):
+        # Bir model yüklemesi dakikalar sürer ve sessizdir; "takıldı" ile
+        # "yükleniyor" ayrımı ilerleme basılmadan yapılamıyor.
+        if time.monotonic() - last_report > 30:
+            last_report = time.monotonic()
+            print(f"  ...yükleniyor (log son satır: {vllm_tail(1).strip()[:120]})")
         time.sleep(5)
 else:
     server.terminate()
+    print(f"\\n--- {VLLM_LOG} (son 30 satır) ---")
+    print(vllm_tail())
     raise SystemExit("vLLM 15 dakikada hazır olmadı. Kart dolu olabilir; sunucu öldürüldü.")
 """
         ),
