@@ -466,6 +466,24 @@ def plan(output: pathlib.Path, **overrides: Any) -> OptimisationPlan:
     return OptimisationPlan(**base)
 
 
+def test_a_quantised_plan_is_refused_rather_than_run_as_something_else(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Preference optimisation does not implement qlora, and must not pretend to.
+
+    It holds two copies of the model -- the policy and the frozen reference -- and both
+    would need quantising with the adapters merged before saving. Silently running a
+    full fine-tune instead would train something other than what the plan records, and
+    the plan is the only durable account of what happened.
+    """
+    with pytest.raises(DatasetError, match="qlora"):
+        train_dpo(
+            plan(tmp_path, model_id="any/model", training_mode="qlora"),
+            [pair()],
+            tokenizer=None,  # type: ignore[arg-type]
+        )
+
+
 def test_a_run_with_no_pairs_is_refused(tmp_path: pathlib.Path) -> None:
     """An empty run that reports success hides that nothing was compared."""
     with pytest.raises(DatasetError, match="no preference pairs"):

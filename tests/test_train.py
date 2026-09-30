@@ -24,6 +24,8 @@ from gotooltrain.train import (
     DEFAULT_MEMORY_BUDGET_GB,
     DTYPES,
     LOSS_MODES,
+    QLORA_RANK,
+    TRAINING_MODES,
     OptimisationPlan,
     RunSummary,
     _apply_step,
@@ -38,6 +40,7 @@ from gotooltrain.train import (
     architecture_facts,
     assert_examples_fit,
     assert_token_format,
+    backbone_and_head,
     completion_only_loss,
     cosine_lr,
     enter_training_mode,
@@ -46,7 +49,9 @@ from gotooltrain.train import (
     is_multimodal,
     iter_epochs,
     length_grouped_batches,
+    load_for_training,
     padding_waste,
+    save_checkpoint,
     steps_for,
     train,
     warmup_steps,
@@ -1232,6 +1237,252 @@ def test_the_plan_refuses_an_impossible_budget() -> None:
 def test_the_plan_refuses_an_unknown_loss_mode() -> None:
     with pytest.raises(DatasetError, match="loss_mode must be one of"):
         plan(loss_mode="magic")
+
+
+def test_a_quantised_base_is_four_times_smaller_and_trains_only_adapters() -> None:
+    """The whole reason the mode exists, as arithmetic.
+
+    A 4-bit base costs a quarter of the weights and nothing else changes: gradients
+    and optimiser state follow the *adapters*, which are a fraction of a percent of
+    the parameters. Getting that wrong in either direction is the failure this mode is
+    meant to avoid -- charging for gradients the adapters do not have would refuse a
+    15 GB card that fits with room, and charging for the base's gradients would admit
+    one that does not.
+    """
+    facts = {"hidden": 2560, "layers": 32, "vocab": 248320, "state_bytes_per_token": 1 << 20}
+    common = {
+        "context_length": 4096,
+        "supervised_share": 0.389,
+        "gradient_checkpointing": True,
+        "optimiser": "adamw",
+    }
+    full = estimate_memory(facts, parameters=4_330_000_000, **common)
+    quantised = estimate_memory(
+        facts,
+        parameters=4_330_000_000,
+        quantised=True,
+        trainable_parameters=20_000_000,
+        **common,
+    )
+
+    assert quantised.weights == pytest.approx(full.weights / 4, rel=1e-6)
+    # The adapters are 20M against 4.33B, so the gradient term collapses.
+    assert quantised.gradients < full.gradients / 200
+    assert quantised.optimiser < full.optimiser / 200
+    # And the activation terms are untouched: the forward pass is the same shape.
+    assert quantised.stored_activations == pytest.approx(full.stored_activations)
+    assert quantised.loss == pytest.approx(full.loss)
+    assert quantised.total < full.total / 2
+    assert quantised.to_record()["quantised"] is True
+
+
+def test_a_quantised_estimate_without_an_adapter_count_is_refused() -> None:
+    """Zero trainable parameters would make the estimate optimistic where it matters.
+
+    The gradient and optimiser terms would be zero, which is not conservative -- it is
+    wrong, and it is wrong in the direction that gets a run started on a card that
+    cannot hold it.
+    """
+    with pytest.raises(ValueError, match="how many parameters"):
+        estimate_memory(
+            {"hidden": 8, "layers": 1, "vocab": 8},
+            parameters=1000,
+            context_length=8,
+            supervised_share=1.0,
+            gradient_checkpointing=False,
+            optimiser="adamw",
+            quantised=True,
+        )
+
+
+def test_the_training_mode_is_named_and_validated() -> None:
+    """A mode that is not implemented must not be selectable by typo."""
+    assert TRAINING_MODES == ("full", "qlora")
+    assert OptimisationPlan(model_id="m", output_dir="o").training_mode == "full"
+    with pytest.raises(DatasetError, match="training_mode must be one of"):
+        OptimisationPlan(model_id="m", output_dir="o", training_mode="lora")
+
+
+def test_a_full_fine_tune_does_not_load_through_the_quantised_path() -> None:
+    """The default has to stay the ordinary loader.
+
+    A quantised base cannot be merged back without dequantising, so choosing it by
+    accident would change the checkpoint that gets published, not just the memory.
+    """
+    calls: list[str] = []
+
+    class Loader:
+        @staticmethod
+        def from_pretrained(weights: str, **kwargs: Any) -> str:
+            calls.append(weights)
+            return "loaded"
+
+    result = load_for_training(
+        Loader, "some/model", OptimisationPlan(model_id="m", output_dir="o"), lambda m: None
+    )
+    assert result == "loaded"
+    assert calls == ["some/model"], "the full path did not use the plain loader"
+
+
+def test_a_quantised_run_without_its_dependencies_says_which_one_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure has to name the package, not raise an ImportError from three frames down.
+
+    On a machine that has neither installed, this is the first thing a reader sees when
+    they set training_mode='qlora' -- and "No module named peft" two frames into a
+    loader is not a message that says what to do.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "peft", None)  # a None entry makes `import` raise
+    plan = OptimisationPlan(model_id="m", output_dir="o", training_mode="qlora")
+    with pytest.raises(DatasetError, match="peft and bitsandbytes"):
+        load_for_training(object, "some/model", plan, lambda m: None)
+
+
+def test_the_backbone_is_found_through_a_peft_wrapper() -> None:
+    """The selective loss needs the stack and the head separately.
+
+    A PEFT model wraps the base, so ``model.model`` is not the backbone any more.
+    Falling back to the full projection here would spend exactly the memory the
+    selective loss exists to save, and nothing would say so.
+    """
+
+    class Backbone:
+        pass
+
+    class Head:
+        pass
+
+    class Base:
+        def __init__(self) -> None:
+            self.model = Backbone()
+            self.lm_head = Head()
+
+    class Peft:
+        def __init__(self) -> None:
+            self.base_model = type("Lora", (), {"model": Base()})()
+
+    backbone, head = backbone_and_head(Peft())
+    assert isinstance(backbone, Backbone)
+    assert isinstance(head, Head)
+
+
+def test_a_model_with_no_separable_head_names_what_it_tried() -> None:
+    with pytest.raises(DatasetError, match="none was found through"):
+        backbone_and_head(object())
+
+
+def test_saving_a_quantised_run_merges_the_adapters_back_into_the_base(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The checkpoint has to stay an ordinary model.
+
+    If the adapters were written instead, the Hub repository would hold a different
+    kind of artefact, ``--resume-from`` would not load it, and the evaluation would
+    need to be told to attach an adapter. Merging keeps every other stage ignorant of
+    how the run was trained.
+    """
+    saved: list[str] = []
+
+    class Peft:
+        merged = False
+
+        def merge_and_unload(self) -> Any:
+            self.merged = True
+            return self
+
+        def save_pretrained(self, path: str, **kwargs: Any) -> None:
+            saved.append(path)
+
+    model = Peft()
+    save_checkpoint(
+        model, OptimisationPlan(model_id="m", output_dir="o", training_mode="qlora"), tmp_path
+    )
+    assert model.merged, "the adapters were written instead of a full model"
+    assert saved == [str(tmp_path)]
+
+
+def test_saving_a_full_run_does_not_try_to_merge_anything(tmp_path: pathlib.Path) -> None:
+    saved: list[str] = []
+
+    class Plain:
+        def merge_and_unload(self) -> Any:
+            raise AssertionError("a full fine-tune has no adapters to merge")
+
+        def save_pretrained(self, path: str, **kwargs: Any) -> None:
+            saved.append(path)
+
+    save_checkpoint(Plain(), OptimisationPlan(model_id="m", output_dir="o"), tmp_path)
+    assert saved == [str(tmp_path)]
+
+
+def test_the_quantised_configuration_is_the_one_the_literature_specifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual settings, asserted without a GPU.
+
+    A quantised run cannot execute here, but the *choices* can be inspected: NF4 with
+    double quantisation is what QLoRA was designed around, ``all-linear`` avoids a
+    hand-written module list that would silently miss this hybrid architecture's
+    linear-attention projections, and alpha = 2r with rank stabilisation is the setting
+    that avoids the "intruder dimensions" which cost generalisation. Those are
+    decisions, and an untested decision is a comment.
+    """
+    torch = pytest.importorskip("torch")
+    peft = pytest.importorskip("peft")
+    transformers = pytest.importorskip("transformers")
+
+    recorded: dict[str, Any] = {}
+
+    class FakeBnB:
+        def __init__(self, **kwargs: Any) -> None:
+            recorded["bnb"] = kwargs
+
+    class FakeLora:
+        def __init__(self, **kwargs: Any) -> None:
+            recorded["lora"] = kwargs
+
+    class Choice:
+        """A model with one small trainable group and a large frozen one."""
+
+        def __init__(self) -> None:
+            self.frozen = torch.nn.Parameter(torch.zeros(1000))
+            self.adapters = torch.nn.Parameter(torch.zeros(20))
+            self.frozen.requires_grad_(False)
+
+        def parameters(self) -> Any:
+            return iter([self.frozen, self.adapters])
+
+    class Loader:
+        @staticmethod
+        def from_pretrained(weights: str, **kwargs: Any) -> Any:
+            recorded["quantization_config"] = kwargs.get("quantization_config")
+            return Choice()
+
+    monkeypatch.setattr(transformers, "BitsAndBytesConfig", FakeBnB)
+    monkeypatch.setattr(peft, "LoraConfig", FakeLora)
+    monkeypatch.setattr(peft, "get_peft_model", lambda base, cfg: base)
+    monkeypatch.setattr(peft, "prepare_model_for_kbit_training", lambda base, **k: base)
+
+    lines: list[str] = []
+    plan = OptimisationPlan(model_id="m", output_dir="o", training_mode="qlora", dtype="bfloat16")
+    result = load_for_training(Loader, "some/model", plan, lines.append)
+
+    assert recorded["bnb"]["load_in_4bit"] is True
+    assert recorded["bnb"]["bnb_4bit_quant_type"] == "nf4"
+    assert recorded["bnb"]["bnb_4bit_use_double_quant"] is True
+    assert recorded["bnb"]["bnb_4bit_compute_dtype"] is torch.bfloat16
+    assert recorded["lora"]["target_modules"] == "all-linear"
+    assert recorded["lora"]["r"] == QLORA_RANK
+    assert recorded["lora"]["lora_alpha"] == 2 * QLORA_RANK, "alpha = 2r, not the default r"
+    assert recorded["lora"]["use_rslora"] is True
+    assert recorded["lora"]["task_type"] == "CAUSAL_LM"
+    assert recorded["quantization_config"] is not None, "the base was loaded unquantised"
+    assert result is not None
+    # And the run is told how little of it is actually trainable.
+    assert any("20" in line and "1,020" in line for line in lines), lines
 
 
 def test_a_second_model_costs_weights_and_nothing_else() -> None:

@@ -19,7 +19,7 @@ yeteneğine sahip bir modele tam fine-tune etmek için çalışma alanı.
 | 6 — Execution reward + DPO (tercih verisi + kayıp + döngü) | ✅ Tamamlandı |
 | 7 — Gerçek 4B checkpoint ile GPU koşusu | ⏳ Donanım gerektiriyor — [Colab defteri](notebooks/gotooltrain_colab.ipynb) hazır |
 
-Kalite kapıları: **1065 test (Windows, Docker'suz) / 1085 (Docker ve rtk ile)**,
+Kalite kapıları: **1079 test (Windows, Docker'suz) / 1099 (Docker ve rtk ile)**,
 coverage %100 (satır + dal), ruff temiz, mypy strict temiz (29 modül).
 
 > Atlanan testler sessiz değil, gerekçeleri skip metninde yazılı: 20'si
@@ -149,7 +149,7 @@ make coverage     # coverage run -m pytest && coverage report  (eşik %100)
 > branch'siz veri yazıp koşuyu
 > *"Can't combine statement coverage data with branch data"* ile düşürüyor.
 
-Dördü de yeşil: **1065 test geçti (22 atlandı, gerekçeli), coverage %100, ruff temiz,
+Dördü de yeşil: **1079 test geçti (22 atlandı, gerekçeli), coverage %100, ruff temiz,
 mypy strict temiz.**
 
 `train()` ve `train_dpo()` gerçek mimariyle çalışır: testler `Qwen3.5-4B`

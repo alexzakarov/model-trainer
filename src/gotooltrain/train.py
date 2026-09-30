@@ -109,6 +109,31 @@ DEFAULT_MEMORY_BUDGET_GB: Final[float] = 40.0
 #: full projection, and the plan records that it was chosen.
 LOSS_MODES: Final[tuple[str, ...]] = ("selective", "builtin")
 
+#: How the weights are trained.
+#:
+#: ``full`` updates every parameter. ``qlora`` keeps the base frozen in 4 bits and
+#: trains low-rank adapters, which drops the resident floor from 17.3 GB to about
+#: 2.2 GB on this model -- the difference between needing a 40 GB card and fitting a
+#: 15 GB one. The adapters are merged back into the base before the checkpoint is
+#: written, so what lands on the Hub is an ordinary model and nothing downstream has
+#: to know which mode produced it.
+#:
+#: What it costs is measured elsewhere and stated plainly: on code and mathematics,
+#: low-rank adaptation learns less than full fine-tuning. It also forgets less. The
+#: mode is chosen in the plan and recorded there, never substituted silently.
+TRAINING_MODES: Final[tuple[str, ...]] = ("full", "qlora")
+
+#: The adapter rank a quantised run uses. 16 is the common default and is what makes
+#: the resident floor tiny; the literature is clear that higher ranks close more of the
+#: gap to full fine-tuning, so this is a knob with a documented direction rather than a
+#: magic number. Rank-stabilised scaling (alpha = 2r) is set alongside it.
+QLORA_RANK: Final[int] = 16
+
+#: Where a quantised run records how much of the base was actually trainable. Adapters
+#: are a fraction of a percent of the parameters; the estimate needs the real number
+#: rather than the base's, or it would charge gradient memory for weights that have
+#: none.
+
 #: Bytes per intermediate activation tensor of shape [tokens, hidden] in bf16.
 _ACTIVATION_BYTES: Final[int] = 2
 
@@ -137,6 +162,16 @@ class MemoryBudget:
     context_length: int
     loss_mode: str
     models: int = 1
+    #: Whether the frozen weights are held quantised. QLoRA keeps the base at 4 bits
+    #: and trains adapters on top, which changes the resident floor by a factor of
+    #: four -- so an estimate that assumed bf16 would refuse a run that fits by a
+    #: wide margin, which is exactly the kind of refusal that makes people stop
+    #: trusting the number.
+    quantised: bool = False
+    #: The parameters that are actually trained. Zero means "all of them", which is
+    #: the full fine-tune case. QLoRA passes the real adapter count, measured after
+    #: injection, so the gradient and optimiser terms are exact rather than a guess.
+    trainable_parameters: int = 0
 
     @property
     def resident(self) -> float:
@@ -158,6 +193,7 @@ class MemoryBudget:
             "context_length": self.context_length,
             "loss_mode": self.loss_mode,
             "models": self.models,
+            "quantised": self.quantised,
             "resident_gb": round(self.resident, 2),
             "stored_activations_gb": round(self.stored_activations, 2),
             "transient_activations_gb": round(self.transient_activations, 2),
@@ -168,8 +204,12 @@ class MemoryBudget:
     def report(self) -> str:
         """A readable breakdown, so the arithmetic is reviewable by a human."""
         copies = f", {self.models} model copies" if self.models > 1 else ""
+        quantised = ", 4-bit base" if self.quantised else ""
+        head = (
+            f"memory estimate @ {self.context_length} ctx, {self.loss_mode} loss{copies}{quantised}"
+        )
         return (
-            f"memory estimate @ {self.context_length} ctx, {self.loss_mode} loss{copies}\n"
+            head + "\n"
             f"    weights              {self.weights:7.2f} GB  (resident)\n"
             f"    gradients            {self.gradients:7.2f} GB  (resident)\n"
             f"    optimiser state      {self.optimiser:7.2f} GB  (resident)\n"
@@ -201,15 +241,7 @@ def completion_only_loss(model: Any, inputs: Mapping[str, Any], labels: Any) -> 
     """
     import torch.nn.functional as functional
 
-    backbone = getattr(model, "model", None)
-    head = getattr(model, "lm_head", None)
-    if backbone is None or head is None:
-        raise DatasetError(
-            "selective loss needs a checkpoint that separates the backbone from the "
-            "vocabulary head (model.model and model.lm_head). This one does not, so the "
-            "full projection cannot be avoided; run with loss_mode='builtin' and a "
-            "smaller context instead."
-        )
+    backbone, head = backbone_and_head(model)
 
     outputs = backbone(**inputs, use_cache=False)
     hidden = getattr(outputs, "last_hidden_state", None)
@@ -270,6 +302,8 @@ def estimate_memory(
     loss_mode: str = "selective",
     batch_size: int = 1,
     models: int = 1,
+    quantised: bool = False,
+    trainable_parameters: int = 0,
 ) -> MemoryBudget:
     """Estimate a run's peak memory, term by term.
 
@@ -291,12 +325,24 @@ def estimate_memory(
     """
     if models < 1:
         raise ValueError(f"a run holds at least one model, got {models}")
+    if quantised and trainable_parameters <= 0:
+        raise ValueError(
+            "a quantised run trains adapters, so it must be told how many parameters "
+            "they have; without that the gradient and optimiser terms would be zero "
+            "and the estimate would be optimistic precisely where it matters"
+        )
     parameters_b = parameters / 1e9
-    weights = parameters_b * 2 * models
-    gradients = parameters_b * 2
+    # NF4 with double quantisation is about half a byte per parameter; the scales and
+    # the fp32 copy of them are what the extra fraction pays for. Approximate, and
+    # named as such rather than folded silently into the parameter count.
+    weight_bytes = 0.5 if quantised else 2
+    weights = parameters_b * weight_bytes * models
+    trained_b = (trainable_parameters or parameters) / 1e9
+    gradients = trained_b * 2
     # Adafactor keeps factored row and column statistics, so its state is a few
-    # megabytes rather than a copy of the parameters. AdamW keeps two.
-    optimiser_gb = 0.02 if optimiser == "adafactor" else parameters_b * 8
+    # megabytes rather than a copy of the parameters. AdamW keeps two. Applied to the
+    # *trained* parameters: under QLoRA that is the adapters, not the base.
+    optimiser_gb = 0.02 if optimiser == "adafactor" else trained_b * 8
 
     tokens = context_length * batch_size
     hidden = int(facts.get("hidden", 0))
@@ -329,6 +375,8 @@ def estimate_memory(
         context_length=context_length,
         loss_mode=loss_mode,
         models=models,
+        quantised=quantised,
+        trainable_parameters=trainable_parameters,
     )
 
 
@@ -378,6 +426,11 @@ class OptimisationPlan:
     #: How the loss is computed. See :data:`LOSS_MODES`; the default projects the
     #: vocabulary only at supervised positions.
     loss_mode: str = "selective"
+    #: ``full`` trains every weight; ``qlora`` keeps the base quantised and trains
+    #: adapters on top. See :data:`TRAINING_MODES`. A name rather than a boolean,
+    #: because the checkpoint that comes out is a different thing -- adapters merged
+    #: back into the base -- and "it was false" does not record that.
+    training_mode: str = "full"
 
     def __post_init__(self) -> None:
         """Reject a plan that cannot train, before it costs a GPU hour to find out."""
@@ -395,6 +448,10 @@ class OptimisationPlan:
             raise DatasetError(f"dtype must be one of {DTYPES}, got {self.dtype!r}")
         if self.optimizer not in OPTIMIZERS:
             raise DatasetError(f"optimizer must be one of {OPTIMIZERS}, got {self.optimizer!r}")
+        if self.training_mode not in TRAINING_MODES:
+            raise DatasetError(
+                f"training_mode must be one of {TRAINING_MODES}, got {self.training_mode!r}"
+            )
         if self.loss_mode not in LOSS_MODES:
             raise DatasetError(f"loss_mode must be one of {LOSS_MODES}, got {self.loss_mode!r}")
         if self.memory_budget_gb <= 0:
@@ -508,6 +565,118 @@ def _supervised_share(examples: Sequence[Any]) -> float:
     return min(1.0, supervised / total)
 
 
+def load_for_training(
+    loader: Any, weights: str, plan: OptimisationPlan, emit: Callable[[str], None]
+) -> Any:
+    """Load the weights and prepare whatever is going to be trained.
+
+    Two modes, and they are genuinely different objects at the end. ``full`` loads the
+    checkpoint and returns it. ``qlora`` loads it in 4 bits, attaches low-rank adapters,
+    and returns a model whose only trainable parameters are those adapters -- the base
+    stays frozen and quantised, which is where the memory goes.
+
+    The quantisation error lands on the frozen base and is not recoverable, so this is
+    a decision recorded in the plan, never a fallback taken because a card was small.
+    """
+    import torch
+
+    if plan.training_mode != "qlora":
+        return loader.from_pretrained(weights, dtype=_torch_dtype(plan.dtype, torch))
+
+    # Imported here, not at module import: a machine without these installed can still
+    # load, inspect and plan a full fine-tune, and the failure for a qlora plan is the
+    # clear one below rather than an ImportError at import time.
+    try:
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        from transformers import BitsAndBytesConfig
+    except ImportError as exc:  # pragma: no cover - depends on the host's extras
+        raise DatasetError(
+            f"training_mode='qlora' needs peft and bitsandbytes, and {exc.name} is not "
+            "installed. Install them, or run with training_mode='full'."
+        ) from exc
+
+    quantisation = BitsAndBytesConfig(
+        load_in_4bit=True,
+        # NF4 is the quantisation QLoRA was designed around; double quantisation
+        # shrinks the scales themselves and is nearly free.
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        # The compute dtype stays the plan's dtype. On a Turing card (T4) bfloat16 is
+        # not supported in hardware, and the plan validator is what stops that, not
+        # this function silently switching.
+        bnb_4bit_compute_dtype=_torch_dtype(plan.dtype, torch),
+    )
+    base = loader.from_pretrained(
+        weights, quantization_config=quantisation, dtype=_torch_dtype(plan.dtype, torch)
+    )
+    # Casts the norms and the head to fp32 and turns on input gradients, which is what
+    # makes a quantised base trainable at all.
+    base = prepare_model_for_kbit_training(  # type: ignore[no-untyped-call]
+        base, use_gradient_checkpointing=False
+    )
+    adapters = LoraConfig(
+        # "all-linear" rather than a list of names: this checkpoint is a hybrid with
+        # linear-attention layers whose projections are not standard attention names,
+        # and a hand-written list would silently miss them.
+        target_modules="all-linear",
+        r=QLORA_RANK,
+        # alpha = 2r is the rank-stabilised setting; the default alpha = r is what
+        # produces the "intruder dimensions" that hurt generalisation.
+        lora_alpha=2 * QLORA_RANK,
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+        use_rslora=True,
+    )
+    tuned = get_peft_model(base, adapters)
+    trainable = sum(p.numel() for p in tuned.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in tuned.parameters())
+    emit(f"qlora: {trainable:,} trainable of {total:,} ({trainable / max(1, total):.3%})")
+    return tuned
+
+
+def backbone_and_head(model: Any) -> Any:
+    """The pair the selective loss needs, through whatever wrapper is in the way.
+
+    ``completion_only_loss`` projects the vocabulary itself so the logits tensor is
+    ``[supervised, vocab]`` rather than ``[sequence, vocab]``. That needs the stack of
+    layers and the head as separate objects. A plain causal LM exposes them as
+    ``model.model`` and ``model.lm_head``; a PEFT model wraps that, so the base has to
+    be unwrapped first.
+
+    Walks the known wrappings rather than guessing one, and refuses with the names it
+    tried when none of them works -- because the alternative, falling back to the full
+    projection, would spend exactly the memory this exists to save.
+
+    The pair is taken as "exposes both attributes", not "is an nn.Module": a caller may
+    hand in something that only looks like a model, and rejecting it here would produce
+    a confusing complaint about a checkpoint shape rather than about the thing that is
+    actually wrong. Whatever is returned is called immediately, so a wrong object fails
+    on the call, loudly, one frame later.
+    """
+    candidates: list[Any] = [model]
+    peft_base = getattr(model, "base_model", None)
+    if peft_base is not None:
+        candidates.append(peft_base)
+        inner = getattr(peft_base, "model", None)
+        if inner is not None:
+            candidates.append(inner)
+
+    tried: list[str] = []
+    for candidate in candidates:
+        backbone = getattr(candidate, "model", None)
+        head = getattr(candidate, "lm_head", None)
+        if backbone is not None and head is not None:
+            return backbone, head
+        tried.append(type(candidate).__name__)
+
+    raise DatasetError(
+        "the selective loss needs a checkpoint that separates the backbone from the "
+        f"vocabulary head, and none was found through {tried}. Run with "
+        "loss_mode='builtin' and a smaller context."
+    )
+
+
 def measure_run(
     model: Any,
     config: Any,
@@ -523,6 +692,12 @@ def measure_run(
     card is in the conversation at all.
     """
     parameters = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    quantised = plan.training_mode == "qlora"
+    # A quantised run trains adapters, and only those carry gradients or optimiser
+    # state. Counting the base's parameters as trainable would overstate the floor by
+    # the factor that made this mode worth having -- 17 GB instead of 2 -- and refuse a
+    # run that fits with room to spare.
     return estimate_memory(
         architecture_facts(config),
         parameters=parameters,
@@ -531,6 +706,8 @@ def measure_run(
         gradient_checkpointing=plan.gradient_checkpointing,
         optimiser=plan.optimizer,
         loss_mode=plan.loss_mode,
+        quantised=quantised,
+        trainable_parameters=trainable if quantised else 0,
     )
 
 
@@ -751,6 +928,26 @@ def assert_examples_fit(examples: Sequence[Any], plan: OptimisationPlan) -> None
             )
 
 
+def save_checkpoint(model: Any, plan: OptimisationPlan, output: Path) -> None:
+    """Write the model, merging adapters back into the base when there are any.
+
+    A quantised run trains adapters, and ``save_pretrained`` on a PEFT model writes
+    those adapters instead of a model -- which would change what the Hub repository
+    contains, what ``--resume-from`` can load, and what the evaluation has to be told
+    about. Merging here keeps the output an ordinary checkpoint, so every other stage
+    keeps working and knows nothing about how it was trained.
+
+    ``merge_and_unload`` dequantises the base on the way, so the saved weights are the
+    plan's dtype rather than 4 bits. It needs room for that: the merged model is
+    roughly eight times the quantised one. On a card that fits the quantised run with
+    the margins the estimate reports, that fits; it is stated here because it is the
+    one moment a quantised run's memory goes up instead of down.
+    """
+    if plan.training_mode == "qlora":
+        model = model.merge_and_unload()
+    model.save_pretrained(str(output), safe_serialization=True)
+
+
 def train(
     plan: OptimisationPlan,
     examples: Sequence[Any],
@@ -810,7 +1007,7 @@ def train(
     model_config = AutoConfig.from_pretrained(weights)
     loader = AutoModelForImageTextToText if is_multimodal(model_config) else AutoModelForCausalLM
     emit(f"model class: {loader.__name__} (multimodal checkpoint: {is_multimodal(model_config)})")
-    model = loader.from_pretrained(weights, dtype=_torch_dtype(plan.dtype, torch))
+    model = load_for_training(loader, weights, plan, emit)
     switched = enter_training_mode(model)
 
     budget = measure_run(
@@ -945,7 +1142,7 @@ def train(
         history.append(_history_entry(step, window_loss, pending, rate))
 
     output = Path(plan.output_dir)
-    model.save_pretrained(str(output), safe_serialization=True)
+    save_checkpoint(model, plan, output)
     tokenizer.save_pretrained(str(output))
     emit(f"saved to {output}")
 
@@ -988,7 +1185,7 @@ def _push_checkpoint(
     directory that a notebook session is about to delete is not much of a record.
     """
     output = Path(plan.output_dir)
-    model.save_pretrained(str(output), safe_serialization=True)
+    save_checkpoint(model, plan, output)
     tokenizer.save_pretrained(str(output))
     write_push_state(output, push_state_payload(plan.to_record(), step, total_steps))
     revision = pusher.push(output, step, total_steps)

@@ -288,6 +288,15 @@ def train_dpo(
     emit = log or (lambda message: None)
     plan_path = plan.write(plan.output_dir)
 
+    if plan.training_mode == "qlora":
+        raise DatasetError(
+            "preference optimisation does not implement training_mode='qlora' yet. It "
+            "holds two copies of the model -- the policy and the frozen reference it is "
+            "compared against -- and both would have to be loaded quantised, with the "
+            "adapters merged back before saving. Running it as a full fine-tune instead "
+            "would train something other than what the plan says, so it stops here."
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(plan.model_id)
     install_template(tokenizer, load_template_source())
     dtype = _torch_dtype(plan.dtype, torch)

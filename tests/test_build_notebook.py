@@ -200,6 +200,52 @@ def test_the_go_download_is_verified_before_it_is_used() -> None:
     assert RTK_SHA256 in cell
 
 
+def test_the_training_mode_is_a_named_choice_with_its_cost_written_down() -> None:
+    """An empty string means full fine-tuning; "qlora" means adapters on a 4-bit base.
+
+    The mapping is done once, in the run cell, and the cost is stated next to the
+    switch -- because the two modes produce different checkpoints, and the difference
+    between them on code is measured and not in the mode's favour.
+    """
+    parameters = parameters_cell()
+    assert 'TRAINING_MODE = ""' in parameters
+    assert '"qlora"' in parameters
+    assert "17.34 GB" in parameters or "17,34" in parameters, "the full fine-tune floor"
+    assert "2.24" in parameters or "2,24" in parameters, "the quantised floor"
+    assert "az ogrenir" in parameters or "az öğrenir" in parameters, "the measured cost"
+    assert '"--training-mode", TRAINING_MODE or "full"' in run_cell()
+
+
+def test_a_quantised_run_can_be_fitted_against_the_card_it_is_meant_for() -> None:
+    """The budget and the mode go to the pipeline together.
+
+    Passing one without the other would fit the run against the wrong floor: 17.3 GB
+    for a run that holds 2.2, which refuses the card the mode exists to allow.
+    """
+    cell = run_cell()
+    assert '"--memory-budget-gb", str(MEMORY_BUDGET_GB)' in cell
+    assert "--training-mode" in cell
+
+
+def test_the_rtk_setup_survives_a_missing_home_directory() -> None:
+    """``rtk init -g`` writes to ``~/.claude/RTK.md`` and needs that directory to exist.
+
+    Measured on the first Colab run, where the return code was 1 and nothing said why.
+    Two things matter: the directory is created and the command retried, and a failure
+    after that does **not** stop the run. rtk's hook is for automatic token savings; the
+    pipeline calls rtk explicitly, so the only cost of a missing hook is one advisory
+    line per command, which the package's own test filters.
+    """
+    cell = toolchain_cell()
+    assert 'pathlib.Path.home() / ".claude"' in cell
+    assert ".mkdir(" in cell, "the directory rtk wants is created"
+    assert '["rtk", "init", "-g"]' in cell, "and the command is retried"
+    assert "stderr" in cell, "both streams are shown, because the reason is in one of them"
+    # The run continues: there is no raise for a failed hook, only for missing binaries.
+    after = cell[cell.index("rtk init -g") :]
+    assert "raise SystemExit" not in after, "a cosmetic hook failure stopped the run"
+
+
 def test_the_go_install_makes_the_toolchain_visible_to_subprocesses() -> None:
     """Installed into a directory on PATH, not into a shell the pipeline never sees.
 

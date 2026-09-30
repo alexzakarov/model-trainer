@@ -180,6 +180,7 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         context_length=8192,
         memory_budget_gb=40.0,
         optimizer="adafactor",
+        training_mode="full",
         epochs=1,
         batch_size=1,
         grad_accum=8,

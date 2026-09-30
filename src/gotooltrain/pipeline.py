@@ -455,6 +455,8 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                     "selective",
                     "--optimizer",
                     options.optimizer,
+                    "--training-mode",
+                    options.training_mode,
                     "--gradient-checkpointing",
                     *options.extra_sft,
                 ),
@@ -581,6 +583,8 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                     "selective",
                     "--optimizer",
                     options.optimizer,
+                    "--training-mode",
+                    options.training_mode,
                     "--gradient-checkpointing",
                     *options.extra_dpo,
                 ),
@@ -657,6 +661,15 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--context-length", type=int, default=8192)
     parser.add_argument("--memory-budget-gb", type=float, default=40.0)
     parser.add_argument("--optimizer", default="adafactor")
+    parser.add_argument(
+        "--training-mode",
+        default="full",
+        choices=("full", "qlora"),
+        help=(
+            "full updates every weight; qlora keeps the base frozen in 4 bits and trains "
+            "adapters, which is what fits a 4B model on a small card"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)

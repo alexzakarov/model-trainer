@@ -96,6 +96,7 @@ def _plan(args: argparse.Namespace) -> OptimisationPlan:
         optimizer=args.optimizer,
         memory_budget_gb=args.memory_budget_gb,
         loss_mode=args.loss_mode,
+        training_mode=args.training_mode,
         hub=_hub_policy(args),
     )
 
@@ -136,6 +137,18 @@ def _add_shared(parser: argparse.ArgumentParser) -> None:
         help=(
             "selective projects the vocabulary only at supervised positions -- the same "
             "arithmetic on 3x less memory; builtin lets the model compute the loss itself"
+        ),
+    )
+    parser.add_argument(
+        "--training-mode",
+        default="full",
+        choices=("full", "qlora"),
+        help=(
+            "full updates every weight; qlora keeps the base frozen in 4 bits and trains "
+            "adapters, which drops the resident floor from 17.3 GB to about 2.2 GB on a "
+            "4B model. Adapters are merged back into the base before saving, so the "
+            "checkpoint stays an ordinary model. On code it learns less than full -- and "
+            "forgets less"
         ),
     )
     parser.add_argument("--resume-from", default=None)

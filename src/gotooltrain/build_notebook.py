@@ -119,6 +119,32 @@ N_SAMPLES = 4
 OPTIMIZER = "adafactor"
 SFT_OUTPUT = "runs/colab-sft"
 
+# --- egitim modu -----------------------------------------------------------
+#
+# ""    -> tam fine-tune. Kartin tum agirliklari, gradyanlari ve optimizer durumunu
+#          tutmasi gerekir. 4B icin kalici taban **17.34 GB**: bu, 15 GB'a hicbir
+#          baglamda sigmaz, ayarlanabilir bir sey degil.
+#
+# "qlora" -> taban 4 bitte dondurulur, ustune dusuk-rank adaptorler egitilir. 4B icin
+#          kalici taban **2.24 GB**. Olculen siniar:
+#
+#              baglam    tam FT    qlora
+#                2048    20.5 GB   5.4 GB
+#                4096    23.6 GB   8.5 GB
+#                8192    29.9 GB  14.8 GB
+#
+#          Yani qlora 15 GB'lik bir kartta 8192'ye kadar sigar; tam FT hicbir yerde.
+#          Adaptorler kaydetmeden once tabana geri birlestirilir, yani yayinlanan
+#          checkpoint yine siradan bir model -- zincirin geri kalani fark etmez.
+#
+# Bedeli olculmus ve yazili: **kod ve matematikte dusuk-rank adaptasyon tam FT'den
+# az ogrenir** (Biderman ve digerleri, 2024), ayni zamanda **daha az unutur**. Bir
+# kart kucuk diye sessizce secilmez; adi burada yazili.
+#
+# Tercih optimizasyonu (DPO) qlora'yi henuz uygulamiyor; istersen o asama acik bir
+# mesajla durur, sessizce tam FT yapmaz.
+TRAINING_MODE = ""          # "" = tam fine-tune | "qlora" = 4-bit taban + adaptorler
+
 # Tercih aşaması, görev dosyası (`data/eval/tasks.jsonl`) ve ornekleme yapacak
 # çalışan bir model gerektirir. O katman kurulana kadar False: atlanan aşama
 # *atlandığını* söyler, sahte bir başarı üretmez.
@@ -325,6 +351,30 @@ print("rtk init -g:", _initialised.returncode)
 for _name, _value in (("stdout", _initialised.stdout), ("stderr", _initialised.stderr)):
     if _value.strip():
         print("  " + _name + ": " + _value.strip()[:400])
+
+# rtk init -g, /root/.claude/RTK.md yazmak istiyor ve o dizin yoksa "Failed to create
+# temp file in /root/.claude" ile düşüyor. Ölçültü: ilk koşuda tam olarak bu oldu ve
+# dönüş kodu 1 tek başına hiçbir şey söylemedi. Dizin yoksa oluşturup yeniden deniyoruz
+# — rtk'nin istediği şey gerçekten bu, ve bir dizin oluşturmak zararsız.
+_claude = pathlib.Path.home() / ".claude"
+if _initialised.returncode != 0:
+    try:
+        _claude.mkdir(parents=True, exist_ok=True)
+        _retry = subprocess.run(
+            ["rtk", "init", "-g"], capture_output=True, text=True, check=False
+        )
+        print("rtk init -g (dizin oluşturulduktan sonra):", _retry.returncode)
+        for _name, _value in (("stdout", _retry.stdout), ("stderr", _retry.stderr)):
+            if _value.strip():
+                print("  " + _name + ": " + _value.strip()[:400])
+    except OSError as _exc:
+        print("rtk hook kurulamadı:", type(_exc).__name__, str(_exc)[:200])
+
+# Kurulum başarısız olsa bile **koşu durmaz**: rtk'nin hook'u otomatik token tasarrufu
+# içindir ve biz rtk'yi alt süreçte açıkça çağırıyoruz, hook'a ihtiyacımız yok. Tek
+# etkisi her komuta bir satır uyarı basması, ve paketin testi o satırı süzüyor.
+# Burada durdurmak, çalışan bir eğitimi kozmetik bir uyarı yüzünden iptal etmek olurdu.
+print("rtk kullanılabilir:", subprocess.run(["rtk", "--version"], check=False).returncode == 0)
 
 # Parçalanma ayarı. CUDA önbelleğinde ayrılmış ama kullanılmayan bloklar uzun
 # bir koşuda birikir ve "boş" görünen belleği yer. Bu ayar ayrılmış blokları
@@ -570,6 +620,9 @@ command = [
     "--learning-rate", str(LEARNING_RATE),
     "--max-records", str(MAX_RECORDS),
     "--sft-output", SFT_OUTPUT,
+    # Bos string "tam fine-tune" demek; boru hatti "full" adini bekliyor. Esleme
+    # burada, tek yerde: parametre hucresinde insan icin okunur, komutta makine icin.
+    "--training-mode", TRAINING_MODE or "full",
 ]
 
 # Tercih zinciri, degerlendirme icin bir gorev dosyasi ve ornekleme yapacak calisan
