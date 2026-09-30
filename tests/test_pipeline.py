@@ -204,6 +204,7 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         revision="sft-8192",
         dataset_version="go-ut-bench-val",
         repo_url="https://example.invalid/repo.git",
+        repo_ref="v1.10.0",
         repo_name="example/repo",
         repo_dir=tmp_path / "repo",
         task_limit=8,
@@ -478,7 +479,11 @@ def test_a_fresh_clone_is_shallow_and_names_the_repository(
 ) -> None:
     """The task builder reads the working tree, not the history.
 
-    Fetching a decade of commits would cost minutes and buy nothing.
+    Fetching a decade of commits would cost minutes and buy nothing. And the reference is
+    pinned: measured, gin's main branch declares ``go 1.26.0`` while the notebook installs
+    1.23.6 with ``GOTOOLCHAIN=local``, so every ``go test`` failed, every package looked
+    already broken, and the mutation stage refused. A tag whose directive the toolchain
+    can satisfy is the fix, and a tag is reproducible besides.
     """
     calls: list[tuple[str, ...]] = []
 
@@ -490,7 +495,25 @@ def test_a_fresh_clone_is_shallow_and_names_the_repository(
     assert pipe._clone_repository(options(tmp_path), lambda m: None) == 0
     assert calls[0][:2] == ("git", "clone")
     assert "--depth" in calls[0], "a shallow clone, because only the tree is read"
+    assert "--branch" in calls[0], "the reference is pinned"
+    assert "v1.10.0" in calls[0]
     assert "https://example.invalid/repo.git" in calls[0]
+
+
+def test_an_unpinned_clone_is_available_for_a_checkout_you_control(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing the reference takes whatever the default branch is.
+
+    Named rather than silent: an unpinned run is one whose tasks depend on what today's
+    main branch happens to contain.
+    """
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        pipe, "stream_command", lambda command, log, emit: calls.append(tuple(command)) or 0
+    )
+    assert pipe._clone_repository(options(tmp_path, repo_ref=""), lambda m: None) == 0
+    assert "--branch" not in calls[0]
 
 
 def test_the_server_is_stopped_even_when_sampling_fails(
@@ -778,7 +801,7 @@ def test_breaking_nothing_is_refused_rather_than_passed_on(
     from gotooltrain import tasks as task_module
 
     monkeypatch.setattr(task_module, "harvest_packages", lambda root, limit: ["pkg"])
-    monkeypatch.setattr(task_module, "introduce_failures", lambda root, pkgs, limit: [])
+    monkeypatch.setattr(task_module, "introduce_failures", lambda root, pkgs, limit, report: [])
     with pytest.raises(DatasetError, match="could be made to fail"):
         pipe._introduce_failure(options(tmp_path), lambda m: None)
 
@@ -805,7 +828,7 @@ def test_the_packages_it_broke_are_reported(
     from gotooltrain import tasks as task_module
 
     monkeypatch.setattr(task_module, "harvest_packages", lambda root, limit: ["a", "b"])
-    monkeypatch.setattr(task_module, "introduce_failures", lambda root, pkgs, limit: ["b"])
+    monkeypatch.setattr(task_module, "introduce_failures", lambda root, pkgs, limit, report: ["b"])
     lines: list[str] = []
     assert pipe._introduce_failure(options(tmp_path), lines.append) == 0
     assert any("b" in line for line in lines), lines
@@ -917,6 +940,38 @@ def test_the_installation_can_be_refused_and_then_the_command_is_named(
             options(tmp_path, serve_command=["python", "-m", "vllm.entrypoints.openai.api_server"]),
             lambda m: None,
         )
+
+
+def test_an_in_process_stage_leaves_a_log_like_every_other_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The caller reads `runs/pipeline/<stage>.log` to say what stopped the run.
+
+    The first version of the in-process runner wrote nothing, so a failed in-process
+    stage left its reason in the scrollback only -- and the notebook's failure handler
+    crashed on the missing file instead of reporting the failure. The reporting of the
+    problem hid the problem.
+    """
+
+    def refuses(emit: Any) -> int:
+        emit("looking at four packages")
+        raise DatasetError("none of them could be made to fail")
+
+    pipeline = Pipeline(
+        [Stage("mutate", ("in-process", "label"), run=refuses)],
+        emit=lambda message: None,
+        log_root=tmp_path,
+    )
+    assert pipeline.run() == 2
+
+    log = tmp_path / "mutate.log"
+    assert log.is_file(), "an in-process stage left no log for the caller to read"
+    text = log.read_text(encoding="utf-8")
+    assert "looking at four packages" in text
+    assert "none of them could be made to fail" in text
+    # And it is in the summary, like every other stage.
+    assert pipeline.results[0].name == "mutate"
+    assert pipeline.results[0].log == log
 
 
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:

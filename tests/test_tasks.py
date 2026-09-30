@@ -478,3 +478,52 @@ def test_a_file_with_nothing_to_flip_is_skipped(tmp_path):
 
     assert introduce_failures(tmp_path, ["pkg"], verifier=verifier) == ["pkg"]
     assert (package / "a.go").read_text() == "package p\n\nvar x = 1\n", "an unrelated file changed"
+
+
+def test_the_report_says_why_each_package_was_left_alone(tmp_path):
+    """Three situations, one sentence, different fixes.
+
+    "None of them could be made to fail" is the same message whether no package passes
+    to begin with (a checkout whose dependencies never resolved), no file carries a
+    comparison, or every mutation left the tests green. Measured on a fresh clone: the
+    first `go test` failed before any mutation, so every package counted as already
+    failing and the reason was invisible.
+    """
+    for name in ("passes", "fails", "nocompare"):
+        package = tmp_path / name
+        package.mkdir()
+        body = "var x = 1" if name == "nocompare" else "func f(a, b int) bool { return a == b }"
+        (package / "p.go").write_text(f"package p\n\n{body}\n")
+
+    def verifier(root, verifier_name, **kwargs):
+        name = root.name
+        if name == "fails":
+            return (1, "", "")  # already failing, and not because of us
+        return (0, "", "")  # the mutation never breaks anything
+
+    report = {}
+    assert (
+        introduce_failures(
+            tmp_path, ["passes", "fails", "nocompare"], verifier=verifier, report=report
+        )
+        == []
+    )
+    assert report["considered"] == 3
+    assert report["already_failing"] == 1
+    assert report["nothing_to_flip"] == 1
+    assert report["survived_the_change"] == 1
+
+
+def test_the_report_counts_a_package_that_breaks(tmp_path):
+    """A package that did break is not in the leftovers."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "p.go").write_text("package p\n\nfunc f(a, b int) bool { return a == b }\n")
+
+    def verifier(root, verifier_name, **kwargs):
+        return (1 if "!=" in (root / "p.go").read_text() else 0, "", "")
+
+    report = {}
+    assert introduce_failures(tmp_path, ["pkg"], verifier=verifier, report=report) == ["pkg"]
+    assert report["survived_the_change"] == 0
+    assert report["already_failing"] == 0

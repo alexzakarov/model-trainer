@@ -124,20 +124,38 @@ class Pipeline:
     def _run_in_process(self, stage: Stage) -> int:
         """A stage that is work in this interpreter rather than another command.
 
-        Only one: preparing the corpus. It is cheap, and a second interpreter start
-        would reload the tokenizer for no reason. It is still a stage, because a stage
-        is what appears in the plan, stops the chain when it fails, and gets a log.
+        Some stages are cheap enough to run here -- preparing the corpus, checking the
+        card, cloning -- and a second interpreter start would be pure overhead. They are
+        still stages: they appear in the plan, they stop the chain when they fail, and
+        they get a log.
+
+        The log is not optional. The first version of this returned without writing one,
+        so a failed in-process stage left its reason only in the scrollback -- and the
+        caller, which reads `runs/pipeline/<stage>.log` to say which stage stopped and
+        why, crashed on the missing file instead. The failure that mattered was hidden by
+        the reporting of it.
         """
+        log_path = self.log_root / f"{stage.name}.log"
+        started = time.monotonic()
         self.emit(f"\n=== {stage.name} ===")
         if stage.run is None:
             raise DatasetError(f"stage {stage.name} is in-process but carries no work to do")
-        try:
-            return int(stage.run(self.emit))
-        except DatasetError as exc:
-            # A refusal, not a crash: the chain stops and says why, which is the whole
-            # reason an empty corpus is caught here rather than by the trainer.
-            self.emit(f"{stage.name} refused: {exc}")
-            return 2
+
+        with log_path.open("w", encoding="utf-8", buffering=1) as log:
+
+            def tee(message: str) -> None:
+                self.emit(message)
+                log.write(message + "\n")
+
+            try:
+                code = int(stage.run(tee))
+            except DatasetError as exc:
+                # A refusal, not a crash: the chain stops and says why, which is the
+                # whole reason an empty corpus is caught here rather than by the trainer.
+                tee(f"{stage.name} refused: {exc}")
+                code = 2
+        self.results.append(StageResult(stage.name, code, time.monotonic() - started, log_path))
+        return code
 
     def _record_failure(self, stage: Stage, code: int) -> None:
         """Name the failed stage where a caller can read it."""
@@ -528,13 +546,21 @@ def _introduce_failure(options: argparse.Namespace, emit: Callable[[str], None])
             f"no Go packages under {options.repo_dir}, so there is nothing to build a task from."
         )
     emit(f"mutate: {len(packages)} package(s) to consider, breaking up to {options.mutations}")
-    broken = introduce_failures(options.repo_dir, packages, limit=options.mutations)
+    report: dict[str, int] = {}
+    broken = introduce_failures(options.repo_dir, packages, limit=options.mutations, report=report)
     if not broken:
+        # "None could be made to fail" is one sentence for three situations, and they
+        # call for different fixes. The counts are what make it actionable -- measured
+        # on a fresh clone, where the first `go test` fails before any mutation because
+        # the module dependencies have never been fetched, so every package looks like
+        # it was already failing.
         raise DatasetError(
             f"none of the {len(packages)} package(s) under {options.repo_dir} could be made "
-            "to fail. A task is a package whose tests fail, so there is nothing to build "
-            "one from: the evaluation would produce no samples, and no samples means no "
-            "preference pair and nothing for preference optimisation to learn from."
+            f"to fail ({report}). A task is a package whose tests fail, so there is "
+            "nothing to build one from: the evaluation would produce no samples, and no "
+            "samples means no preference pair and nothing for preference optimisation to "
+            "learn from. If every package counts as already failing, the checkout cannot "
+            "be tested here at all -- run `go test ./...` in it and see why."
         )
     emit(f"mutate: broke {broken}")
     return 0
@@ -564,9 +590,13 @@ def _clone_repository(options: argparse.Namespace, emit: Callable[[str], None]) 
             "whatever happens to be there would build tasks against the wrong source."
         )
 
-    emit(f"repository: cloning {options.repo_url} (shallow) into {directory}")
+    emit(f"repository: cloning {options.repo_url} at {options.repo_ref} (shallow) into {directory}")
+    command = ["git", "clone", "--depth", "1"]
+    if options.repo_ref:
+        command += ["--branch", options.repo_ref]
+    command += [options.repo_url, str(directory)]
     return stream_command(
-        ("git", "clone", "--depth", "1", options.repo_url, str(directory)),
+        tuple(command),
         pathlib.Path(options.log_root) / "repo.log",
         emit,
     )
@@ -1072,6 +1102,17 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--dataset-version", default="go-ut-bench-val")
     parser.add_argument("--repo-url", default="https://github.com/gin-gonic/gin.git")
+    parser.add_argument(
+        "--repo-ref",
+        default="v1.10.0",
+        help=(
+            "the tag or branch the tasks are built from. Pinned, and pinned to a release "
+            "whose go directive the notebook's toolchain can satisfy -- measured: gin's "
+            "main declares go 1.26.0, the notebook installs 1.23.6 and sets "
+            "GOTOOLCHAIN=local, so every `go test` failed and every package looked "
+            "already broken"
+        ),
+    )
     parser.add_argument("--repo-name", default="gin-gonic/gin")
     parser.add_argument("--repo-dir", default="runs/eval-repo", type=pathlib.Path)
     parser.add_argument("--task-limit", type=int, default=8, help="cap packages, 0 for all")

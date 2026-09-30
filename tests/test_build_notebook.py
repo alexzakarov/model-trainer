@@ -297,6 +297,19 @@ def test_the_run_cell_does_not_swallow_a_failure() -> None:
     assert "returncode" in cell
 
 
+def test_the_failure_report_does_not_crash_on_a_missing_log() -> None:
+    """The code that reports a failure must not become one.
+
+    Measured: in-process stages used to write no log, so this line raised
+    FileNotFoundError -- and the failure that mattered was hidden by the reporting of
+    it. The stages write logs now, but the handler still does not assume it, because a
+    stage can fail before its log exists.
+    """
+    cell = run_cell()
+    assert "if log.is_file():" in cell, "the log is opened without checking it is there"
+    assert "log dosyasi yok" in cell, "and a missing one is reported rather than raised"
+
+
 def test_the_run_cell_names_the_stage_that_stopped_it() -> None:
     """The pipeline stops at a failed stage and says which.
 

@@ -192,6 +192,7 @@ def introduce_failures(
     limit: int = 1,
     timeout_s: int = 300,
     verifier: Callable[[Path, str], tuple[int, str, str]] | None = None,
+    report: dict[str, int] | None = None,
 ) -> list[str]:
     """Make some passing packages fail, so there is something to ask for.
 
@@ -207,16 +208,32 @@ def introduce_failures(
     ``verifier`` is the seam the tests use. The default runs the real toolchain, so no
     caller has to know it exists.
 
+    ``report`` is filled in with why each package was left alone, because "none of them
+    could be made to fail" is the same sentence for three different situations: no
+    package passes to begin with (a checkout whose dependencies will not resolve), no
+    file carries a comparison, and every mutation left the tests green. They call for
+    different fixes, so they are counted separately.
+
     Returns the packages it broke, so the caller can say what it did.
     """
     check = verifier or (lambda base, name: run_verifier(base, name, timeout_s=timeout_s))
+    stats = report if report is not None else {}
+    for key in ("considered", "already_failing", "nothing_to_flip", "survived_the_change"):
+        stats.setdefault(key, 0)
+
     broken: list[str] = []
     for package in packages:
         if len(broken) >= limit:
             break
+        stats["considered"] += 1
         base = Path(root) / package
         if check(base, "go_test")[0] != 0:
-            continue  # already failing, so not something this step caused
+            # Already failing, so not something this step caused. If *every* package
+            # lands here the checkout cannot be tested at all, which is a different
+            # problem from having nothing to break.
+            stats["already_failing"] += 1
+            continue
+        flipped = False
         for path in sorted(base.glob("*.go")):
             if path.name.endswith("_test.go"):
                 continue
@@ -224,11 +241,17 @@ def introduce_failures(
             mutated = flip_equality(original)
             if mutated is None:
                 continue
+            flipped = True
             path.write_text(mutated, encoding="utf-8")
             if check(base, "go_test")[0] != 0:
                 broken.append(package)
                 break
             path.write_text(original, encoding="utf-8")
+        else:
+            if not flipped:
+                stats["nothing_to_flip"] += 1
+            else:
+                stats["survived_the_change"] += 1
     return broken
 
 

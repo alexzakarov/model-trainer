@@ -736,9 +736,16 @@ if result.returncode:
         log = pathlib.Path("runs/pipeline") / f"{stage}.log"
         print(f"\\nDURAN ASAMA: {stage} (cikis kodu {info['exit_code']})")
         print(f"log: {log}")
-        print("\\n--- son 25 satir ---")
-        for line in log.read_text(encoding="utf-8", errors="replace").splitlines()[-25:]:
-            print("  ", line)
+        # Log yoksa **çökmüyoruz**. Ölçüldü: in-process aşamalar önce log yazmıyordu ve
+        # bu satır FileNotFoundError verince asıl hata görünmez oldu — hatayı bildiren
+        # kod, hatayı gizledi. Artık her aşama log yazıyor, ama burada yine de
+        # varsayılmıyor: bir aşama logunu oluşturamadan düşebilir.
+        if log.is_file():
+            print("\\n--- son 25 satir ---")
+            for line in log.read_text(encoding="utf-8", errors="replace").splitlines()[-25:]:
+                print("  ", line)
+        else:
+            print("\\n(log dosyasi yok; asama kendi ciktisini yukarida birakti)")
     else:
         print(f"\\nDURAN ASAMA: bilinmiyor; {failure} yazilmadi.")
     raise SystemExit(
