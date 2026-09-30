@@ -191,6 +191,7 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         extra_sft=[],
         extra_dpo=[],
         run_gate=True,
+        run_device_check=True,
         run_corpus=True,
         run_data=True,
         run_sft=True,
@@ -248,6 +249,121 @@ def test_an_in_process_stage_without_work_says_so_rather_than_reporting_success(
         pipeline._run_in_process(pipeline.stages[0])  # the branch under test
 
 
+def test_the_card_is_checked_before_anything_is_downloaded(tmp_path: pathlib.Path) -> None:
+    """A full fine-tune of a 4B model has a 17.34 GB floor and needs ~29 GB at 8192.
+
+    A wrong accelerator found after the corpus download costs ten minutes; found as a
+    CUDA OOM forty minutes into training it costs an hour and leaves a run that looked
+    like it was working. The check is a stage, and it is first -- so it is in the plan,
+    it can be seen in a dry run, and nothing upstream of it has run yet.
+    """
+    names = [stage.name for stage in pipe.build_stages(options(tmp_path))]
+    assert names[0] == "device", f"the card check is not first: {names}"
+    assert names.index("device") < names.index("corpus"), "and precedes the download"
+
+    stage = next(s for s in pipe.build_stages(options(tmp_path)) if s.name == "device")
+    assert stage.run is not None, "the stage has no work attached"
+    lines: list[str] = []
+    assert stage.run(lines.append) == 0
+    # No CUDA here, and that is reported rather than treated as a refusal: the plan is
+    # still worth rehearsing on a machine that cannot run it.
+    assert any("device" in line for line in lines), lines
+
+
+def test_a_card_smaller_than_the_budget_is_called_out(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The estimate below is for a different machine, and saying so is the point.
+
+    Reported rather than fatal, because the number to change is the budget -- and a
+    refusal that does not say which knob to turn is a refusal people work around.
+    """
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_properties=lambda index: types.SimpleNamespace(
+            name="Fake T4", total_memory=15 * 1024**3
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+    lines: list[str] = []
+    assert pipe._check_device(options(tmp_path, memory_budget_gb=40.0), lines.append) == 0
+
+    joined = "\n".join(lines)
+    assert "Fake T4" in joined
+    assert "smaller than the 40 GB" in joined
+    assert "--memory-budget-gb" in joined, "the refusal names the knob to turn"
+
+
+def test_a_card_that_cannot_hold_the_run_is_not_a_silent_continue(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No CUDA has to be visible in the log, or a CPU rehearsal reads as a real run."""
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.cuda = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+    lines: list[str] = []
+    assert pipe._check_device(options(tmp_path), lines.append) == 0
+    assert any("no CUDA" in line for line in lines), lines
+
+
+def test_a_card_that_fits_is_reported_without_a_warning(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card that can hold the run should not be told it cannot.
+
+    A warning printed unconditionally is worse than none: it trains the reader to skip
+    the line, which is the line that matters when the card is wrong.
+    """
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_properties=lambda index: types.SimpleNamespace(
+            name="A100-SXM4-40GB", total_memory=40 * 1024**3
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+    lines: list[str] = []
+    assert pipe._check_device(options(tmp_path, memory_budget_gb=40.0), lines.append) == 0
+    assert any("A100" in line for line in lines)
+    assert not any("smaller than" in line for line in lines), lines
+
+
+def test_a_host_without_torch_skips_the_card_check_rather_than_failing(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pipeline is a Python program before it is a GPU program.
+
+    Preparing a corpus, checking a plan and rehearsing the stage order are all things
+    someone may want on a machine that has never had torch installed -- and failing
+    here would take all of that away for a check that only matters to the last stage.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def without_torch(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "torch":
+            raise ImportError("No module named 'torch'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_torch)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+
+    lines: list[str] = []
+    assert pipe._check_device(options(tmp_path), lines.append) == 0
+    assert any("torch not installed" in line for line in lines), lines
+
+
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:
     """Each stage consumes what the one before it produced.
 
@@ -259,6 +375,7 @@ def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.
     """
     names = [stage.name for stage in pipe.build_stages(options(tmp_path))]
     assert names == [
+        "device",
         "quality-gate",
         "corpus",
         "sft-data",
@@ -278,7 +395,7 @@ def test_a_switched_off_stage_disappears_from_the_chain(tmp_path: pathlib.Path) 
     names = [
         stage.name for stage in pipe.build_stages(options(tmp_path, run_eval=False, run_dpo=False))
     ]
-    assert names == ["quality-gate", "corpus", "sft-data", "sft"]
+    assert names == ["device", "quality-gate", "corpus", "sft-data", "sft"]
     assert not any("eval" in name or "dpo" in name or name == "preferences" for name in names)
 
 
@@ -679,7 +796,17 @@ def test_selecting_nothing_is_reported_rather_than_silently_succeeding(
 ) -> None:
     """A pipeline with no stages has not succeeded at anything."""
     assert (
-        pipe.main(["--no-gate", "--no-corpus", "--no-data", "--no-sft", "--no-eval", "--no-dpo"])
+        pipe.main(
+            [
+                "--no-device",
+                "--no-gate",
+                "--no-corpus",
+                "--no-data",
+                "--no-sft",
+                "--no-eval",
+                "--no-dpo",
+            ]
+        )
         == 0
     )
     assert "nothing to do" in capsys.readouterr().out

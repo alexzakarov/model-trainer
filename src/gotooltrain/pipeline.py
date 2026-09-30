@@ -363,6 +363,45 @@ def measure_dataset(
     }
 
 
+def _check_device(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
+    """Fail in seconds if the card cannot hold the run.
+
+    The estimate the training stage prints is the same arithmetic; getting it before
+    the download means a wrong accelerator costs ten seconds instead of ten minutes,
+    and -- more importantly -- it is the difference between "this card is too small"
+    and a CUDA OOM that arrives after the run has already been going long enough to
+    look like it was working.
+
+    No CUDA is not a refusal. The pipeline runs under test on a CPU-only machine, and
+    a plan is still worth rehearsing there. It is reported, because a run that will
+    fall over at the first forward pass should say so rather than appear healthy.
+    """
+    try:
+        import torch
+    except ImportError:
+        emit("device: torch not installed; skipping the card check")
+        return 0
+
+    if not torch.cuda.is_available():
+        emit(
+            "device: no CUDA device visible. This run will not train here; the check "
+            "is reported rather than fatal so the plan can still be rehearsed."
+        )
+        return 0
+
+    properties = torch.cuda.get_device_properties(0)
+    total_gb = properties.total_memory / (1024**3)
+    emit(f"device: {properties.name}, {total_gb:.1f} GB")
+    if total_gb + 1e-6 < options.memory_budget_gb:
+        emit(
+            f"device: the card is smaller than the {options.memory_budget_gb:.0f} GB this "
+            "run is fitted against, so the estimate below is for a different machine. "
+            "Lower --memory-budget-gb to this card's size to get a refusal you can act "
+            "on, or point the run at the card it was fitted for."
+        )
+    return 0
+
+
 def _write_sft_data(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
     """Prepare the training corpus from the options this run was given.
 
@@ -385,6 +424,21 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
     """The chain, in the order it has to happen, from the options given."""
     sft = options.sft_output
     stages: list[Stage] = []
+
+    # First, before anything is downloaded: is this card even in the conversation?
+    # A full fine-tune of a 4B model has a 17.34 GB resident floor and needs about
+    # 29 GB at 8192 tokens. Discovering that after the corpus download wastes minutes,
+    # and discovering it as a CUDA OOM forty minutes into training wastes an hour and
+    # leaves a run that looks like it was working.
+    if options.run_device_check:
+        stages.append(
+            Stage(
+                "device",
+                ("in-process", "is there a card that can hold this run"),
+                run=lambda emit: _check_device(options, emit),
+            )
+        )
+
     if options.run_gate:
         stages.append(Stage("quality-gate", ("python", "-m", "pytest", "-q", "-x", "-rs")))
     if options.run_corpus:
@@ -701,6 +755,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     add_common(parser)
     parser.add_argument("--no-gate", action="store_true")
     parser.add_argument("--no-corpus", action="store_true")
+    parser.add_argument("--no-device", action="store_true")
     parser.add_argument("--no-data", action="store_true")
     parser.add_argument("--no-sft", action="store_true")
     parser.add_argument("--no-eval", action="store_true")
@@ -720,6 +775,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     values.update(
         run_gate=not args.no_gate,
         run_corpus=not args.no_corpus,
+        run_device_check=not args.no_device,
         run_data=not args.no_data,
         run_sft=not args.no_sft,
         run_eval=not args.no_eval,

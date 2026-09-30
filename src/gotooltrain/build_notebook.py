@@ -119,31 +119,28 @@ N_SAMPLES = 4
 OPTIMIZER = "adafactor"
 SFT_OUTPUT = "runs/colab-sft"
 
-# --- egitim modu -----------------------------------------------------------
+# --- eğitim modu -----------------------------------------------------------
 #
-# ""    -> tam fine-tune. Kartin tum agirliklari, gradyanlari ve optimizer durumunu
-#          tutmasi gerekir. 4B icin kalici taban **17.34 GB**: bu, 15 GB'a hicbir
-#          baglamda sigmaz, ayarlanabilir bir sey degil.
+# Bu defter **tam fine-tune** için düzenlendi: her ağırlık güncellenir.
 #
-# "qlora" -> taban 4 bitte dondurulur, ustune dusuk-rank adaptorler egitilir. 4B icin
-#          kalici taban **2.24 GB**. Olculen siniar:
+# Tam FT'nin kalıcı tabanı 4B için **17,34 GB** (ağırlık 8,66 + gradyan 8,66 +
+# adafactor 0,02). Bu, ayarlanabilir bir sayı değil; hangi kartın masada olduğunu
+# belirleyen şey. Ölçülen toplamlar:
 #
-#              baglam    tam FT    qlora
-#                2048    20.5 GB   5.4 GB
-#                4096    23.6 GB   8.5 GB
-#                8192    29.9 GB  14.8 GB
+#     bağlam   toplam    kart
+#      4096    23,33 GB  >= 24 GB
+#      8192    29,33 GB  >= 32 GB   (A100 40 GB, A100 80 GB)
+#     16384    41,32 GB  > 40 GB    (A100 80 GB gerekir)
 #
-#          Yani qlora 15 GB'lik bir kartta 8192'ye kadar sigar; tam FT hicbir yerde.
-#          Adaptorler kaydetmeden once tabana geri birlestirilir, yani yayinlanan
-#          checkpoint yine siradan bir model -- zincirin geri kalani fark etmez.
-#
-# Bedeli olculmus ve yazili: **kod ve matematikte dusuk-rank adaptasyon tam FT'den
-# az ogrenir** (Biderman ve digerleri, 2024), ayni zamanda **daha az unutur**. Bir
-# kart kucuk diye sessizce secilmez; adi burada yazili.
-#
-# Tercih optimizasyonu (DPO) qlora'yi henuz uygulamiyor; istersen o asama acik bir
-# mesajla durur, sessizce tam FT yapmaz.
-TRAINING_MODE = ""          # "" = tam fine-tune | "qlora" = 4-bit taban + adaptorler
+# `"qlora"` aracın içinde var (4-bit taban + adaptörler, kalıcı taban 2,24 GB,
+# 8192'de 14,8 GB) ama **bu defterin koştuğu şey değil**. Ölçülmüş bedeli: kod ve
+# matematikte düşük-rank adaptasyon tam FT'den az öğrenir (Biderman ve diğerleri,
+# 2024). Seçmek istersen bir kart küçük diye değil, bilerek seç.
+TRAINING_MODE = ""          # tam fine-tune. "qlora" araca bağlı, bu defterin değil.
+
+# İlk aşama kartı kontrol eder ve bu bütçeye sığmıyorsa **indirme başlamadan**
+# söyler. Korpustan önce çalışır çünkü yanlış kartı 10 dakika sonra öğrenmenin
+# kimseye faydası yok.
 
 # Tercih aşaması, görev dosyası (`data/eval/tasks.jsonl`) ve ornekleme yapacak
 # çalışan bir model gerektirir. O katman kurulana kadar False: atlanan aşama
@@ -459,14 +456,23 @@ olmalı. Depo şu an boş; ilk push onu doldurur. `upload_folder` model card yaz
 
 ## ⚠️ GPU seçimi
 
-4B **tam** fine-tune AdamW ile ~18 GB (ağırlık + gradyan) ister. Colab'da:
+Tam fine-tune'un **kalıcı tabanı 17,34 GB** — ağırlık 8,66 + gradyan 8,66 +
+adafactor 0,02. Bu ayarlanabilir bir sayı değil. Üstüne aktivasyon binince ölçülen
+toplamlar (8192 varsayılan):
 
 | Runtime | VRAM | Bu defter |
 |---|---|---|
-| T4 (ücretsiz) | 15 GB | ❌ çalışmaz |
-| L4 | 24 GB | ⚠️ Adafactor + kısa bağlamla sığar |
-| **A100 40 GB** | 40 GB | ✅ önerilen |
-| A100 80 GB | 80 GB | ✅ |
+| T4 (ücretsiz) | 16 GB | ❌ 17,34 GB tabanı bile sığmıyor |
+| L4 | 24 GB | ⚠️ 4096'ya kadar (23,33 GB); 8192'de 29,33 GB, sığmaz |
+| **A100 40 GB** | 40 GB | ✅ önerilen — 8192'de 29,33 GB |
+| A100 80 GB | 80 GB | ✅ 16384 de sığar (41,32 GB) |
+
+Yani **A100 40 GB** bu defterin hedefi. 1. hücredeki `CONTEXT_LENGTH` ve
+`MEMORY_BUDGET_GB` bu karta göre seçildi.
+
+Yanlış kartı **indirme başlamadan** öğrenirsin: boru hattının ilk aşaması kartı
+okur ve bu bütçeye sığmıyorsa söyler. Korpustan önce çalışır, çünkü yanlış kartı
+on dakika sonra öğrenmenin kimseye faydası yok.
 
 Aşağıdaki hücre yetersiz VRAM'i sessizce geçmez — adını ve nedenini söyler.
 """
