@@ -77,6 +77,33 @@ _PARAMETERS_BODY = """
 # durur. 16384 isteyen 40 GB'lık bir kartta reddedilecek, 80 GB'lıkta geçecek.
 CONTEXT_LENGTH = 8192
 MEMORY_BUDGET_GB = 40.0
+
+# Kaldığın yerden devam?
+#
+# Boş bırakırsan **taban modelden** başlarsın: Qwen/Qwen3.5-4B, sıfırdan.
+# Bu, ilk koşu için doğru olan.
+#
+# Hugging Face'te bu projeden çıkmış bir checkpoint varsa buraya o repo id'sini yaz
+# (yukarıdaki HF_REPO_ID ile aynısı), ağırlıklar oradan yüklenir. Ama neyi geri
+# getirdiğini bil: yayınlanan klasör yalnızca `save_pretrained` çıktısıdır —
+# ağırlık ve tokenizer. **Optimizer durumu, scheduler, adım sayacı ve push
+# geçmişi saklanmaz.** Yani:
+#
+#   * Adafactor'ın momentleri sıfırdan başlar → ilk birkaç adımın gradyanı
+#     daha büyük, bir an için geri gidebilirsin.
+#   * Adım sayacı 1'den başlar → daha önce gördüğü örnekleri **ikinci kez** görürsün.
+#   * Yayın geçmişi boş sayılır → ilk push yeni sayılır.
+#
+# Bu bir "kaldığı yerden devam" değil, "o ağırlıklarla yeniden eğitim".
+# Gerçek devam için optimizer durumu da saklanmalı; şu an saklanmıyor.
+#
+# DİKKAT: boş bırakırsan ve repoda zaten bir checkpoint varsa, ilk push'ta (25.
+# adım) o checkpoint'in üzerine **yazılır** — 25 adım ilerlemiş taban model
+# göndereceksin. Geri dönüşü olmayan bir hata. 12. hücre ne gönderileceğini
+# söyler.
+
+RESUME_FROM = ""                       # aşağıda "resume :" satırı ne yazıyorsa o
+
 EXPANDABLE_SEGMENTS = True               # parçalanmayı azaltır (bkz. 4. hücre)
 EPOCHS = 1
 BATCH_SIZE = 1
@@ -91,6 +118,7 @@ PUSH_EVERY = 25                        # optimizer adımı
 print(f"repo   : {REPO_URL}@{REPO_REF}")
 print(f"model  : {MODEL_ID}")
 print(f"push to: {HF_REPO_ID} every {PUSH_EVERY} steps (dry_run={DRY_RUN})")
+print(f"resume : {RESUME_FROM or 'yok - taban modelden sıfırdan'}")
 """
 
 
@@ -772,8 +800,21 @@ command = [
 ]
 if DRY_RUN:
     command.append("--hub-dry-run")
+if RESUME_FROM:
+    command += ["--resume-from", RESUME_FROM]
 
 print(" ".join(command))
+print()
+if RESUME_FROM:
+    print(f"Kaldığın yerden: ağırlıklar {RESUME_FROM}'den. Yine de sıfırdan eğitim:")
+    print("  optimizer durumu, adım sayacı ve yayın geçmişi geri gelmiyor.")
+else:
+    print(f"Kaldığın yerden devam YOK: ağırlıklar {MODEL_ID}'den, sıfırdan.")
+    if PUSH_EVERY:
+        print(
+            f"  Repoda bir checkpoint varsa {PUSH_EVERY}. adımdaki push onun üstüne yazacak. "
+            "Bunu istemiyorsan RESUME_FROM'u yukarıda doldur."
+        )
 print()
 print("Bu hücre saatlerce sürebilir. Yayınlar PUSH_EVERY adımda birer olur,")
 print("böylece sekme kapanırsa kaybedilen şey en fazla PUSH_EVERY adım olur.")
@@ -874,6 +915,24 @@ if not DRY_RUN:
     for name in sorted(files)[:15]:
         print("  ", name)
     print("\\ngit log gibi: her push bir commit. Adım commit mesajında.")
+
+    # Depoda zaten eğitilmiş bir model varsa, iki seçenek var ve ikisi de
+    # sessiz değil: ya o ağırlıklarla devam edersin, ya da sıfırdan başlayıp
+    # üzerine yazarsın. Kararı okuyana bırakmak, "nereye yazıyoruz" sorusunu
+    # cevapsız bırakmaktan iyi.
+    WEIGHTS = {"model.safetensors", "model.safetensors.index.json", "pytorch_model.bin"}
+    if WEIGHTS & set(files) and not RESUME_FROM:
+        print(
+            "\\n  DIKKAT: repoda eğitilmiş bir checkpoint var, ama RESUME_FROM boş."
+        )
+        print(
+            "  Bu koşu taban modelden başlayacak ve ilk push'ta o checkpoint'in"
+        )
+        print(
+            f"  UZERINE yazacak. Devam etmek istiyorsan 1. hücrede"
+        )
+        print(f'    RESUME_FROM = "{HF_REPO_ID}"')
+        print("  yazıp 10. hücreyi yeniden çalıştır.")
 else:
     print("\\nDRY_RUN=True idi: hiçbir şey gönderilmedi. Yukarıdaki 'pushed step'")
     print("satırlarını 10. hücrede görmüş olmalısınız. Şimdi DRY_RUN=False yapıp")

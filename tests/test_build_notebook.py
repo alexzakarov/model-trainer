@@ -500,6 +500,46 @@ def test_the_notebook_states_the_budget_it_is_fitted_against() -> None:
     assert '"--loss-mode", "selective"' in joined
 
 
+def test_resuming_is_a_named_decision_not_a_hand_edited_command() -> None:
+    """The question "does it continue from the checkpoint on the Hub?" needs a switch.
+
+    The mechanism exists (``--resume-from``), but nothing in the notebook reached it,
+    so the answer was only discoverable by reading the CLI. A reader who asked has to
+    find the parameter, and see what it does *and does not* bring back.
+    """
+    parameters = "\n".join(sources(c) for c in build_cells() if c["cell_type"] == "code")
+    assert 'RESUME_FROM = ""' in parameters
+    assert '"--resume-from", RESUME_FROM' in parameters
+
+
+def test_the_notebook_does_not_claim_a_resume_restores_the_run() -> None:
+    """What a resume restores is narrower than "continues where it left off".
+
+    The published folder is ``save_pretrained`` output plus provenance: weights and
+    tokenizer. Optimizer moments, the schedule, the step count and the push history
+    are all gone, so the same examples get trained a second time. Calling it a
+    resume without that costs someone a silently doubled epoch.
+    """
+    parameters = "\n".join(sources(c) for c in build_cells() if c["cell_type"] == "code")
+    assert "Optimizer durumu, scheduler, adım sayacı ve push" in parameters
+    assert "yeniden eğitim" in parameters, "the honest name for what it does"
+    assert "ikinci kez" in parameters, "the same examples are seen again"
+
+
+def test_an_existing_checkpoint_is_never_overwritten_without_a_word() -> None:
+    """A push replaces the repository, so overwriting is a data-loss event.
+
+    ``upload_folder`` writes to the default branch, so a run started from the base
+    model replaces a trained checkpoint at the first push. That must be announced,
+    with the way out named, not left for the reader to notice after 25 steps.
+    """
+    joined = "\n".join(code_cells())
+    assert "if RESUME_FROM:" in joined, "the command must say which weights it loaded"
+    assert "model.safetensors" in joined, "the check looks for real weights, not any file"
+    assert "yazacak" in joined, "the overwrite is named"
+    assert 'RESUME_FROM = "{HF_REPO_ID}"' in joined, "the way out is spelled out, not described"
+
+
 def test_the_reader_is_told_which_term_of_the_estimate_is_fuzzy() -> None:
     """The activation terms are estimates; the resident ones are not.
 
