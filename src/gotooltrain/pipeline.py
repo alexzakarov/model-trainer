@@ -26,6 +26,7 @@ cannot poison anything.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import pathlib
 import subprocess
@@ -448,6 +449,43 @@ def _check_device(options: argparse.Namespace, emit: Callable[[str], None]) -> i
     return 0
 
 
+def _served_module(command: Sequence[str]) -> str | None:
+    """The module a ``python -m <module>`` serve command names, if it names one."""
+    parts = [str(part) for part in command]
+    if "-m" in parts:
+        index = parts.index("-m")
+        if index + 1 < len(parts):
+            return parts[index + 1]
+    return None
+
+
+def _introduce_failure(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
+    """Break a passing package so the evaluation has something to ask for.
+
+    Refuses when it breaks nothing. The alternative -- continuing to the task builder
+    with a healthy checkout -- produces an empty task file and stops two stages later
+    with a message about the corpus rather than about the cause.
+    """
+    from .tasks import harvest_packages, introduce_failures
+
+    packages = harvest_packages(options.repo_dir, limit=options.task_limit or 10_000)
+    if not packages:
+        raise DatasetError(
+            f"no Go packages under {options.repo_dir}, so there is nothing to build a task from."
+        )
+    emit(f"mutate: {len(packages)} package(s) to consider, breaking up to {options.mutations}")
+    broken = introduce_failures(options.repo_dir, packages, limit=options.mutations)
+    if not broken:
+        raise DatasetError(
+            f"none of the {len(packages)} package(s) under {options.repo_dir} could be made "
+            "to fail. A task is a package whose tests fail, so there is nothing to build "
+            "one from: the evaluation would produce no samples, and no samples means no "
+            "preference pair and nothing for preference optimisation to learn from."
+        )
+    emit(f"mutate: broke {broken}")
+    return 0
+
+
 def _clone_repository(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
     """Fetch the repository the evaluation tasks are built from.
 
@@ -502,6 +540,21 @@ def _serve_and_generate(options: argparse.Namespace, emit: Callable[[str], None]
     # and the failure for that would be a FileNotFoundError inside the branch that was
     # supposed to start a server.
     server_log.parent.mkdir(parents=True, exist_ok=True)
+
+    if options.serve:
+        # Checked before the server is started, and before the sampling that depends on
+        # it. The install is *not* done here: `pip install vllm` can move torch, and a
+        # pipeline that rearranges the environment it is running in is a pipeline whose
+        # failures have two possible causes. The message names the command instead.
+        module = _served_module(options.serve_command)
+        if module and importlib.util.find_spec(module) is None:
+            raise DatasetError(
+                f"the sampling stage needs `{module}`, which is not installed. Install "
+                f"it ({sys.executable} -m pip install {module.split('.')[0]}) or run with "
+                "--no-serve against a server you started yourself. Without samples there "
+                "are no preference pairs, and preference optimisation would have nothing "
+                "to learn from."
+            )
     server: Any = None
     try:
         if options.serve:
@@ -753,6 +806,22 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
             )
         )
     if options.run_eval and options.run_tasks:
+        # The task builder keeps only packages whose tests *fail*, because a package the
+        # model already passes measures nothing. A healthy checkout therefore yields no
+        # tasks at all -- measured: gin's first three packages all passed, and the
+        # builder wrote an empty file, so the chain stopped one stage before the
+        # evaluation that needs it.
+        #
+        # So a failure is introduced first. Only packages that pass are touched, and the
+        # change is kept only if it really makes them fail.
+        if options.mutate:
+            stages.append(
+                Stage(
+                    "mutate",
+                    ("in-process", "introduce a fixable failure so there is a task"),
+                    run=lambda emit: _introduce_failure(options, emit),
+                )
+            )
         stages.append(
             Stage(
                 "tasks",
@@ -939,6 +1008,17 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo-name", default="gin-gonic/gin")
     parser.add_argument("--repo-dir", default="runs/eval-repo", type=pathlib.Path)
     parser.add_argument("--task-limit", type=int, default=8, help="cap packages, 0 for all")
+    parser.add_argument(
+        "--mutations",
+        type=int,
+        default=1,
+        help="how many passing packages to break, so the evaluation has tasks to ask for",
+    )
+    parser.add_argument(
+        "--no-mutate",
+        action="store_true",
+        help="take the repository as it is; only useful for a checkout whose tests already fail",
+    )
     parser.add_argument("--vllm-port", type=int, default=8000)
     parser.add_argument("--serve-timeout", type=int, default=1800)
     parser.add_argument("--no-serve", action="store_true", help="assume a server is already up")
@@ -1019,6 +1099,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_token_check=not args.no_token,
         run_repo=not args.no_repo,
         run_tasks=not args.no_tasks,
+        mutate=not args.no_mutate,
         run_data=not args.no_data,
         run_sft=not args.no_sft,
         run_eval=not args.no_eval,

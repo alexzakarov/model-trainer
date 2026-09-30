@@ -142,10 +142,18 @@ TRAINING_MODE = ""          # tam fine-tune. "qlora" araca bağlı, bu defterin 
 # söyler. Korpustan önce çalışır çünkü yanlış kartı 10 dakika sonra öğrenmenin
 # kimseye faydası yok.
 
-# Tercih aşaması, görev dosyası (`data/eval/tasks.jsonl`) ve ornekleme yapacak
-# çalışan bir model gerektirir. O katman kurulana kadar False: atlanan aşama
-# *atlandığını* söyler, sahte bir başarı üretmez.
-RUN_PREFERENCE_STAGE = False
+# Tercih aşaması (eval -> preferences -> DPO). Zincir artık uçtan uca bağlı: depo
+# klonlanır, içine düzeltilebilir bir hata konur, görev çıkarılır, eğitilmiş
+# checkpoint servis edilir, örnekler toplanır, tercih çiftleri çıkarılır ve DPO
+# çalışır.
+#
+# True olduğunda **ek olarak** gerekir: `vllm` kurulu olması ve 40 GB'lık kartta iki
+# aşamanın sırayla sığması (önce SFT, sonra servis). Sunucu açılmazsa hata
+# `runs/pipeline/server.log` içinde sebebiyle durur.
+#
+# False bırakılırsa aşama **adıyla** atlanır; sessizce yok sayılmaz. Koşu hücresi
+# hangi durumda olduğunu komuttan önce yazar.
+RUN_PREFERENCE_STAGE = True
 
 # Kalite kapısı her koşuda yeniden kurulmaz; dakikalar verir ve sonucu
 # değiştirmez. Kapatmak bir tercih olduğu için burada adı var.
@@ -640,7 +648,10 @@ except Exception as _exc:  # noqa: BLE001 - Colab dışında da çalışmalı
 _placeholder = "hf_mock_replace_me"
 if HF_TOKEN and HF_TOKEN != _placeholder:
     os.environ["HF_TOKEN"] = HF_TOKEN
-    print(f"HF_TOKEN ortama kondu ({HF_TOKEN[:7]}..., {len(HF_TOKEN)} karakter)")
+    # Uzunluk basılıyor, önek değil. Bir token'ın ilk karakterleri de bir parçasıdır
+    # ve notebook çıktısı kaydedilir. Çıktıya yazılan her karakter, o token'ın bir
+    # parçasının o çıktıyı okuyan herkese gitmesi demek.
+    print(f"HF_TOKEN ortama kondu ({len(HF_TOKEN)} karakter)")
 elif DRY_RUN:
     os.environ["HF_TOKEN"] = "hf_mock_dry_run"
     print("DRY_RUN=True: gerçek bir token gerekmiyor")
@@ -668,10 +679,18 @@ command = [
     "--training-mode", TRAINING_MODE or "full",
 ]
 
-# Tercih zinciri, degerlendirme icin bir gorev dosyasi ve ornekleme yapacak calisan
-# bir model ister. Yoksa bu asamalar **acikca** atlanir; sahte bir basari uretilmez.
-if not RUN_PREFERENCE_STAGE:
+# Tercih zinciri (klon -> görev -> eval -> çiftler -> DPO) her koşuda *söylenir*.
+# İlk kez burada anlaşılmadı: bayrak False olduğu için komuta --no-eval --no-dpo
+# ekleniyordu ve okuyan kişi bunu yalnızca komut satırına bakarak çıkarabiliyordu.
+if RUN_PREFERENCE_STAGE:
+    print("tercih aşaması: AÇIK (klon -> görev -> eval -> preferences -> DPO)")
+    print("  ek gereksinim: vllm kurulu olmalı ve sunucu karta sığmalı")
+else:
     command += ["--no-eval", "--no-dpo"]
+    print("tercih aşaması: KAPALI (RUN_PREFERENCE_STAGE=False)")
+    print("  --no-eval --no-dpo eklendi; çift üretilmez ve DPO çalışmaz")
+    print("  açmak için 1. hücrede RUN_PREFERENCE_STAGE = True yap")
+print()
 
 # Kalite kapisi her kosuda yeniden kurulmaz; tekrar etmek dakikalar verir ve
 # sonucu degistirmez. Kapatmak bir tercih, sessizce yapilmaz.

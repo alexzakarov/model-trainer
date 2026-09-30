@@ -12,6 +12,7 @@ script.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import pathlib
 import subprocess
@@ -195,6 +196,8 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         run_token_check=True,
         run_repo=True,
         run_tasks=True,
+        mutate=True,
+        mutations=1,
         log_root=tmp_path / "logs",
         model_name="policy",
         revision="sft-8192",
@@ -672,6 +675,92 @@ def test_a_named_revision_is_used_as_given(tmp_path: pathlib.Path) -> None:
     )
 
 
+def test_the_served_module_is_read_off_the_command() -> None:
+    """The check has to know what to look for without being told twice."""
+    assert pipe._served_module(["python", "-m", "vllm.entrypoints.openai.api_server"]) == (
+        "vllm.entrypoints.openai.api_server"
+    )
+    assert pipe._served_module(["/usr/bin/serve", "--port", "8000"]) is None
+    # A dangling -m names nothing, and guessing would check the wrong module.
+    assert pipe._served_module(["python", "-m"]) is None
+
+
+def test_suppressing_the_mutation_keeps_the_task_stage(tmp_path: pathlib.Path) -> None:
+    """--no-mutate is for a checkout whose tests already fail.
+
+    The task builder still has to run: it is what turns those failures into the records
+    the evaluation reads.
+    """
+    names = [stage.name for stage in pipe.build_stages(options(tmp_path, mutate=False))]
+    assert "mutate" not in names
+    assert "tasks" in names, "suppressing the mutation must not suppress the tasks"
+
+
+def test_a_server_that_cannot_be_imported_is_refused_before_it_is_started(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checking after starting it means the reason is a dead process, not a missing one.
+
+    The install is deliberately not done from here: `pip install vllm` can move torch,
+    and a pipeline that rearranges the environment it runs in is one whose failures have
+    two possible causes. The message names the command instead.
+    """
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(DatasetError, match="which is not installed"):
+        pipe._serve_and_generate(
+            options(
+                tmp_path,
+                serve_command=["python", "-m", "definitely_not_installed_anywhere"],
+            ),
+            lambda m: None,
+        )
+
+
+def test_breaking_nothing_is_refused_rather_than_passed_on(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Continuing with a healthy checkout stops two stages later, about the wrong thing.
+
+    The task builder would write an empty file, the evaluation would sample nothing, and
+    the failure would arrive as "no preference pairs" -- pointing at the pairs rather
+    than at the reason there are none.
+    """
+    from gotooltrain import tasks as task_module
+
+    monkeypatch.setattr(task_module, "harvest_packages", lambda root, limit: ["pkg"])
+    monkeypatch.setattr(task_module, "introduce_failures", lambda root, pkgs, limit: [])
+    with pytest.raises(DatasetError, match="could be made to fail"):
+        pipe._introduce_failure(options(tmp_path), lambda m: None)
+
+
+def test_a_checkout_with_no_packages_says_so(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing to look at is a different problem from nothing breakable."""
+    from gotooltrain import tasks as task_module
+
+    monkeypatch.setattr(task_module, "harvest_packages", lambda root, limit: [])
+    with pytest.raises(DatasetError, match="no Go packages"):
+        pipe._introduce_failure(options(tmp_path), lambda m: None)
+
+
+def test_the_packages_it_broke_are_reported(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What was broken belongs in the run's record.
+
+    The fixture the model is given is no longer the repository that was cloned, and a
+    reader comparing the two needs to know that.
+    """
+    from gotooltrain import tasks as task_module
+
+    monkeypatch.setattr(task_module, "harvest_packages", lambda root, limit: ["a", "b"])
+    monkeypatch.setattr(task_module, "introduce_failures", lambda root, pkgs, limit: ["b"])
+    lines: list[str] = []
+    assert pipe._introduce_failure(options(tmp_path), lines.append) == 0
+    assert any("b" in line for line in lines), lines
+
+
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:
     """Each stage consumes what the one before it produced.
 
@@ -690,6 +779,7 @@ def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.
         "sft-data",
         "sft",
         "repo",
+        "mutate",
         "tasks",
         "eval",
         "preferences",

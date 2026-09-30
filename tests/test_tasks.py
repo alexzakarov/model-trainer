@@ -17,9 +17,11 @@ from gotooltrain.tasks import (
     VERIFIERS,
     GoTask,
     build_task_from_package,
+    flip_equality,
     go_version,
     harvest_packages,
     has_go,
+    introduce_failures,
     read_tasks,
     run_verifier,
     task_works_now,
@@ -351,3 +353,128 @@ def test_a_task_file_with_blank_lines_is_read(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "tasks.jsonl"
     path.write_text("\n\n", encoding="utf-8")
     assert read_tasks(path) == []
+
+
+# ------------------------------------------------- making something to ask for
+
+
+def test_an_equality_comparison_is_flipped():
+    """A comparison compiles, changes behaviour, and fails an existing assertion.
+
+    That is the loop being trained: read the failure, find the code, change it, run the
+    tests again. Mutations that only break the build are easier to write and easier to
+    game, because the compiler names the fix.
+    """
+    assert flip_equality("if a == b {") == "if a != b {"
+    assert flip_equality("x := f() == g()") == "x := f() != g()"
+
+
+def test_only_the_first_comparison_is_touched():
+    """One change per attempt: two changes and a failure no longer says which one did it."""
+    assert flip_equality("a == b && c == d") == "a != b && c == d"
+
+
+def test_nothing_to_flip_is_reported_rather_than_rewritten():
+    """A rewrite that changes nothing would be stored as a task that is already solved."""
+    assert flip_equality("if a != b {") is None
+    assert flip_equality("package p") is None
+
+
+def test_a_passing_package_is_broken_so_there_is_a_task(tmp_path):
+    """A healthy checkout yields no tasks, because the builder keeps only failing ones.
+
+    So the chain stops one stage before the evaluation that needs a task, and one has
+    to be introduced.
+    """
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "p.go").write_text("package p\n\nfunc f(a, b int) bool { return a == b }\n")
+
+    seen = []
+
+    def verifier(root, verifier_name, **kwargs):
+        text = (package / "p.go").read_text()
+        seen.append("!=" in text)
+        return (1 if "!=" in text else 0, "", "")
+
+    assert introduce_failures(tmp_path, ["pkg"], verifier=verifier) == ["pkg"]
+    assert (package / "p.go").read_text().count("!=") == 1, "the mutation was not left in place"
+
+
+def test_a_mutation_that_changes_nothing_is_reverted(tmp_path):
+    """Otherwise a package whose tests still pass is stored as a task already solved."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    original = "package p\n\nfunc f(a, b int) bool { return a == b }\n"
+    (package / "p.go").write_text(original)
+
+    def verifier(root, verifier_name, **kwargs):
+        return (0, "", "")  # the mutation never breaks anything
+
+    assert introduce_failures(tmp_path, ["pkg"], verifier=verifier) == []
+    assert (package / "p.go").read_text() == original, "a no-op mutation was left behind"
+
+
+def test_a_package_that_already_fails_is_left_alone(tmp_path):
+    """Its failure is not ours, and storing it would credit this step with work it did not do."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    original = "package p\n\nfunc f(a, b int) bool { return a == b }\n"
+    (package / "p.go").write_text(original)
+
+    def verifier(root, verifier_name, **kwargs):
+        return (1, "", "")  # already failing before anything was touched
+
+    assert introduce_failures(tmp_path, ["pkg"], verifier=verifier) == []
+    assert (package / "p.go").read_text() == original
+
+
+def test_only_as_many_packages_are_broken_as_were_asked_for(tmp_path):
+    """Each mutation costs a `go test`, so the count is the caller's to choose."""
+    for name in ("a", "b", "c"):
+        package = tmp_path / name
+        package.mkdir()
+        (package / "p.go").write_text("package p\n\nfunc f() bool { return 1 == 1 }\n")
+
+    calls = []
+
+    def verifier(root, verifier_name, **kwargs):
+        mutated = "!=" in (root / "p.go").read_text()
+        calls.append(mutated)
+        return (1 if mutated else 0, "", "")
+
+    assert introduce_failures(tmp_path, ["a", "b", "c"], limit=2, verifier=verifier) == ["a", "b"]
+    assert len(calls) == 4, f"it kept going after the limit: {calls}"
+
+
+def test_test_files_are_never_mutated(tmp_path):
+    """Rewriting a test to make itself fail is not a task, it is a broken corpus.
+
+    The model would be asked to repair a test that was deliberately sabotaged, and the
+    failing assertion would point at the test rather than at the code.
+    """
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "p.go").write_text("package p\n")
+    (package / "p_test.go").write_text("package p\n\nfunc TestX(t *T) { _ = 1 == 1 }\n")
+    before = (package / "p_test.go").read_text()
+
+    def verifier(root, verifier_name, **kwargs):
+        return (0, "", "")
+
+    assert introduce_failures(tmp_path, ["pkg"], verifier=verifier) == []
+    assert (package / "p_test.go").read_text() == before
+
+
+def test_a_file_with_nothing_to_flip_is_skipped(tmp_path):
+    """Not every file contains a comparison, and the next one might."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "a.go").write_text("package p\n\nvar x = 1\n")
+    (package / "b.go").write_text("package p\n\nfunc f(a, b int) bool { return a == b }\n")
+
+    def verifier(root, verifier_name, **kwargs):
+        return (1 if "!=" in (package / "b.go").read_text() else 0, "", "")
+
+    assert introduce_failures(tmp_path, ["pkg"], verifier=verifier) == ["pkg"]
+    assert (package / "a.go").read_text() == "package p\n\nvar x = 1\n", "an unrelated file changed"

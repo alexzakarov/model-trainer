@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -164,6 +164,72 @@ def validate_task(task: GoTask, fixture_root: str | Path) -> GoTask:
             "run and the task is ungradable."
         )
     return task
+
+
+def flip_equality(text: str) -> str | None:
+    """Rewrite the first equality comparison into its opposite, or ``None``.
+
+    A comparison compiles, changes behaviour, and surfaces as a failing assertion whose
+    diagnostic names the value and the expectation -- which is the loop the model is
+    being trained on: read the failure, find the code, change it, run the tests again.
+    The mutations that only *break the build* are easier to write and easier to game,
+    because the compiler names the fix.
+
+    ``None`` when there is no equality to flip, rather than a rewrite that changes
+    nothing: a mutation that changes nothing would be stored as a task that is already
+    solved.
+    """
+    index = text.find("==")
+    if index < 0:
+        return None
+    return text[:index] + "!=" + text[index + 2 :]
+
+
+def introduce_failures(
+    root: str | Path,
+    packages: Sequence[str],
+    *,
+    limit: int = 1,
+    timeout_s: int = 300,
+    verifier: Callable[[Path, str], tuple[int, str, str]] | None = None,
+) -> list[str]:
+    """Make some passing packages fail, so there is something to ask for.
+
+    The task builder keeps only packages whose verification *fails*, because a package
+    the base model already passes measures nothing. A healthy repository therefore
+    yields no tasks at all -- measured: gin's first three packages all passed, and the
+    builder wrote an empty file.
+
+    The change is reverted unless it actually makes the tests fail, and packages whose
+    tests already fail are left alone: those failures are not ours, and storing one as
+    a task would credit this step with work it did not do.
+
+    ``verifier`` is the seam the tests use. The default runs the real toolchain, so no
+    caller has to know it exists.
+
+    Returns the packages it broke, so the caller can say what it did.
+    """
+    check = verifier or (lambda base, name: run_verifier(base, name, timeout_s=timeout_s))
+    broken: list[str] = []
+    for package in packages:
+        if len(broken) >= limit:
+            break
+        base = Path(root) / package
+        if check(base, "go_test")[0] != 0:
+            continue  # already failing, so not something this step caused
+        for path in sorted(base.glob("*.go")):
+            if path.name.endswith("_test.go"):
+                continue
+            original = path.read_text(encoding="utf-8")
+            mutated = flip_equality(original)
+            if mutated is None:
+                continue
+            path.write_text(mutated, encoding="utf-8")
+            if check(base, "go_test")[0] != 0:
+                broken.append(package)
+                break
+            path.write_text(original, encoding="utf-8")
+    return broken
 
 
 def build_task_from_package(
