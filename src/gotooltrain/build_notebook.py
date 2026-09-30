@@ -87,37 +87,61 @@ GO_SHA256: Final[str] = "9379441ea310de000f33a4dc767bd966e72ab2826270e038e78b2c5
 #: symlink into /usr/local/bin would be a second, silently-different installation.
 GO_ROOT: Final[str] = "/usr/local/go"
 
+#: RTK, at the version and digest ``docker/go-sandbox/Dockerfile`` already pins.
+#:
+#: The same two-source verification, for the same reason. The Dockerfile states what
+#: was reviewed and then proves the publisher still says so; this reuses both, so the
+#: notebook and the sandbox image are provably running the *same* binary. That is not
+#: tidiness: the catalogue's output format is RTK's, so a notebook on a different
+#: build is measuring a different format than the eval harness will.
+RTK_VERSION: Final[str] = "0.50.0"
+RTK_SHA256: Final[str] = "bc2b8902b0d9c796c82ef45f16ae2307e17757afeca5ee156235a3dc7bda5f89"
+RTK_BASE_URL: Final[str] = "https://github.com/rtk-ai/rtk/releases/download"
+#: The musl build is static, so it runs on a glibc image without a loader.
+RTK_ASSET: Final[str] = "rtk-x86_64-unknown-linux-musl.tar.gz"
 
-def _go_cell() -> dict[str, Any]:
-    """Install the Go toolchain, verified, before anything that shells out to it.
 
-    Colab ships no Go. That is not a cosmetic gap: the catalogue's commands are
-    ``go build``/``go test``/``go doc``, the package's own suite exercises the real
-    commands, and without Go those tests fail as *a broken package* rather than
-    reporting the missing dependency. So the dependency is installed here, and the
-    quality gate downstream can mean something.
+def _toolchain_cell() -> dict[str, Any]:
+    """Install Go and rtk, both pinned and verified, before anything shells out.
 
-    Deliberately a download rather than ``apt-get install golang-go``: the distro
-    package is a different Go version than the one the project's documents and
-    sandbox image name, and ``GOTOOLCHAIN=local`` would then refuse the modules the
-    tests generate.
+    Colab ships neither. That is not a cosmetic gap: the catalogue's commands *are*
+    ``rtk go build``/``rtk go test``/``rtk read``/``rtk grep``, and the package's own
+    suite runs the real commands. Without these two, a missing dependency is
+    reported as a broken project -- the single most expensive kind of confusion,
+    because it is indistinguishable from a real regression and costs a round trip
+    through a metered machine to discover.
+
+    Both installs are verified against a pinned digest, and rtk additionally against
+    the publisher's own ``checksums.txt``, which is exactly what the sandbox Dockerfile
+    does. One cell rather than two so the download-and-verify helper has a single
+    definition; each install still names itself as it goes, so a failure says which
+    tool was the problem.
     """
     return _code(f"""
-# @title 4 — Go toolchain
+# @title 4 — Go ve rtk toolchain'leri
 #
-# Colab'da Go yok. Bu bir eksik değil, kırık bir paket gibi okunur: katalogdaki
-# komutların çoğu `go` çağırır ve `go test` gerçekten koşmadığında kalite kapısı
-# "harness bozuk" diye kırılır. Bu yüzden kurulum kapıdan *önce* yapılıyor.
+# Colab'da ikisi de yok. Bu bir eksik değil, **kapının kırılma biçimi**: katalogdaki
+# komutların çoğu rtk üzerinden çalışır (`rtk go test`, `rtk read`, `rtk grep`), ve
+# paketin kendi testleri gerçek komutları koşar. rtk yokken `go_test` "rtk not found"
+# ile HARNESS_ERROR döner ve hata **kırık paket** gibi görünür — oysa kırık olan
+# ortamdır.
 #
-# Doğrulama: go.dev'in yayınladığı sha256 sabitlendi. İndirilen baytlar bu değerle
-# eşleşmeden kurulmuyor. Sandbox imajı da aynı kuralı uyguluyor.
+# İkisi de sabit + doğrulanmış. rtk'nin sürümü ve digest'i docker/go-sandbox/Dockerfile'ın
+# sabitlediğiyle **aynı**: yani defter ile sandbox imajı kanıtlanabilir biçimde aynı
+# binary'yi koşuyor. Katalogun çıktı formatı rtk'nin formatıdır; farklı bir build
+# üzerinde ölçmek, eval harness'ın ölçeceği formatı ölçmemek demektir.
+#
+# rtk doğrulaması çift kaynaklı: gömülü sabit *ve* yayıncının checksums.txt'i. Uyuşmazsa
+# kurulum iptal edilir.
 #
 # GOTOOLCHAIN=local: go.mod'daki `go 1.23` direktifinin ağdan toolchain indirmesini
-# engeller — yani testlerin ürettiği modüller ağ olmadan da derlenir.
+# engeller — testlerin ürettiği modüller ağ olmadan da derlenir.
 
 import hashlib
 import io
+import os
 import pathlib
+import platform
 import shutil
 import tarfile
 import urllib.request
@@ -126,37 +150,89 @@ GO_VERSION = {GO_VERSION!r}
 GO_SHA256 = {GO_SHA256!r}
 GO_ROOT = {GO_ROOT!r}
 
-archive = f"go{{GO_VERSION}}.linux-amd64.tar.gz"
-url = f"https://go.dev/dl/{{archive}}"
-print(f"indiriliyor: {{url}}")
+RTK_VERSION = {RTK_VERSION!r}
+RTK_SHA256 = {RTK_SHA256!r}
+RTK_BASE_URL = {RTK_BASE_URL!r}
+RTK_ASSET = {RTK_ASSET!r}
 
-with urllib.request.urlopen(url, timeout=300) as response:
-    payload = response.read()
 
-digest = hashlib.sha256(payload).hexdigest()
-print(f"sha256      : {{digest}}")
-if digest != GO_SHA256:
+def fetch_verified(url: str, expected_sha256: str, what: str) -> bytes:
+    \"\"\"İndir, hash'le, sabitle karşılaştır. Uyuşmazsa kurulum yapılmaz.\"\"\"
+    print(f"  indiriliyor {{what}}: {{url}}")
+    with urllib.request.urlopen(url, timeout=300) as response:
+        payload = response.read()
+    digest = hashlib.sha256(payload).hexdigest()
+    print(f"  sha256           {{digest}}")
+    if digest != expected_sha256:
+        raise SystemExit(
+            f"{{what}} doğrulanamadı. İndirilen {{digest}}, beklenen {{expected_sha256}}. "
+            "Kurulum iptal edildi — doğrulanmamış bir toolchain, hiç kurmamaktan kötüdür."
+        )
+    return payload
+
+
+if platform.machine() not in ("x86_64", "AMD64"):
     raise SystemExit(
-        f"Go tarball doğrulanamadı. İndirilen {{digest}}, beklenen {{GO_SHA256}}. "
-        "Kurulum iptal edildi — sağlıksız bir toolchain ile devam etmek, eksik "
-        "bir toolchain'den daha kötüdür."
+        f"bu defter {{platform.machine()}} mimarisi için; rtk'nin sabitlenmiş build'i "
+        "x86_64. Colab'da T4/L4/A100 seçtiğiniz için bu burada sorun olmaz."
     )
+
+# ------------------------------------------------------------------ Go
+print("Go kuruluyor...")
+go_archive = f"go{{GO_VERSION}}.linux-amd64.tar.gz"
+go_payload = fetch_verified(f"https://go.dev/dl/{{go_archive}}", GO_SHA256, "go")
 
 root = pathlib.Path(GO_ROOT)
 if root.exists():
     shutil.rmtree(root)
-with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+with tarfile.open(fileobj=io.BytesIO(go_payload)) as tar:
     try:
         tar.extractall(root.parent, filter="data")
     except TypeError:  # Python < 3.12 has no filter argument
         tar.extractall(root.parent)
 
-os.environ["PATH"] = f"{{root / 'bin'}}:{{os.environ['PATH']}}"
+# ------------------------------------------------------------------ rtk
+print("rtk kuruluyor...")
+base = f"{{RTK_BASE_URL}}/v{{RTK_VERSION}}"
+rtk_payload = fetch_verified(f"{{base}}/{{RTK_ASSET}}", RTK_SHA256, "rtk")
+
+# İkinci kaynak: yayıncının kendi checksum listesi. Sabit "neyi inceledik"i söyler,
+# bu indirme "yayıncı hâlâ öyle diyor"u kanıtlar.
+with urllib.request.urlopen(f"{{base}}/checksums.txt", timeout=120) as response:
+    published = response.read().decode("utf-8", "replace")
+expected_line = next(
+    (line for line in published.splitlines() if line.split()[-1:] == [RTK_ASSET]), None
+)
+if expected_line is None:
+    raise SystemExit(f"checksums.txt içinde {{RTK_ASSET}} yok; yayıncı listeyi değiştirmiş.")
+if expected_line.split()[0] != RTK_SHA256:
+    raise SystemExit(
+        f"sabit ile yayıncı uyuşmuyor. Gömülü {{RTK_SHA256}}, yayıncı "
+        f"{{expected_line.split()[0]}}. İkisi de doğru olmalı."
+    )
+print(f"  yayıncı da doğruladı: {{expected_line.split()[0][:16]}}...")
+
+rtk_dir = pathlib.Path("/tmp/rtk-dist")
+if rtk_dir.exists():
+    shutil.rmtree(rtk_dir)
+rtk_dir.mkdir(parents=True)
+with tarfile.open(fileobj=io.BytesIO(rtk_payload)) as tar:
+    tar.extractall(rtk_dir)
+binary = rtk_dir / "rtk"
+shutil.copy2(binary, "/usr/local/bin/rtk")
+os.chmod("/usr/local/bin/rtk", 0o755)
+shutil.rmtree(rtk_dir, ignore_errors=True)
+
+# ------------------------------------------------------------------ PATH
+# os.environ üzerinden, shell export'u değil: subprocess os.environ'ı miras alır,
+# dolayısıyla hem kalite kapısı hem eğitim koşusu aynı toolchain'i görür. Shell'e
+# kurulup sürece aktarılmayan bir Go, kapıdan geçer ve eğitimde patlar.
+os.environ["PATH"] = f"{{root / 'bin'}}:/usr/local/bin:{{os.environ['PATH']}}"
 os.environ["GOTOOLCHAIN"] = "local"
 
-# `run` 3. hücreden; subprocess os.environ'ı miras alır, dolayısıyla hem eğitim
-# koşusu hem kalite kapısı aynı toolchain'i görür.
+# `run` 3. hücreden.
 print(run("go", "version"))
+print(run("rtk", "--version"))
 """)
 
 
@@ -204,11 +280,11 @@ Bu defter şunu yapar, başka hiçbir şeyi:
 
 1. Depoyu remote'dan çeker (`alexzakarov/model-trainer`).
 2. `pip install -e ".[dev,train]"` ile kurar.
-3. Go toolchain'i **sha256 doğrulayarak** kurar (Colab'da Go yok).
+3. **Go ve rtk toolchain'lerini** sabitlenmiş digest'lerle kurar (Colab'da ikisi de yok).
 4. Go-UT-Bench korpusunu indirip ölçer (lisans süzgeci dahil).
 5. Token formatını **gerçek Qwen3.5-4B tokenizer'ıyla** doğrular — maske yanlışsa
    burada durur, GPU saatleri harcanmaz.
-6. 4B tam fine-tune'u başlatır ve **her N adımda** checkpoint'ı Hub'a gönderir.
+6. 4B tam fine-tune'u başlatır ve **her N adımta** checkpoint'ı Hub'a gönderir.
 
 ---
 
@@ -311,7 +387,7 @@ os.chdir(target)
 print("cwd:", os.getcwd())
 """
         ),
-        _go_cell(),
+        _toolchain_cell(),
         _code(
             """
 # @title 5 — Token: Colab secret ya da mock

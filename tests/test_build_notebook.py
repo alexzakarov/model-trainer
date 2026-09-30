@@ -23,6 +23,10 @@ from gotooltrain.build_notebook import (
     GO_SHA256,
     GO_VERSION,
     NOTEBOOK_PATH,
+    RTK_ASSET,
+    RTK_BASE_URL,
+    RTK_SHA256,
+    RTK_VERSION,
     assemble_notebook,
     build_cells,
     write_notebook,
@@ -126,7 +130,7 @@ def test_the_cells_run_in_a_usable_order() -> None:
         " 1 — Parameters",
         " 2 — GPU ön kontrolü",
         " 3 — Depoyu çek ve kur",
-        " 4 — Go toolchain",
+        " 4 — Go ve rtk toolchain'leri",
         " 5 — Token: Colab secret ya da mock",
         " 6 — Kalite kapısı (paket kendi testini koşar)",
         " 7 — Go korpusunu indir, süz, ölç",
@@ -137,16 +141,59 @@ def test_the_cells_run_in_a_usable_order() -> None:
     ]
 
 
-def test_the_go_toolchain_is_installed_before_the_quality_gate() -> None:
-    """The gate runs commands. Without Go it fails as a broken package.
+def test_both_external_toolchains_are_installed_before_the_quality_gate() -> None:
+    """The gate runs real commands through both of them.
 
-    Colab ships no Go, and the catalogue is mostly ``go build``/``go test``. So the
-    dependency has to arrive before the gate, or the gate reports a missing
-    toolchain as a broken project -- which is exactly the confusion this cell
-    removes.
+    Colab ships neither Go nor rtk, and the catalogue's tools *are* ``rtk go test``
+    and friends. So without this cell a missing dependency is reported as a broken
+    project -- indistinguishable from a real regression, and it costs a round trip
+    through a metered machine to discover.
     """
     joined = "\n".join(code_cells())
-    assert joined.index("go.dev/dl") < joined.index('"pytest", "-q')
+    gate = joined.index('"pytest", "-q')
+    for fragment in ("go.dev/dl", RTK_BASE_URL, RTK_ASSET):
+        assert joined.index(fragment) < gate, fragment
+
+
+def test_rtk_is_installed_at_the_version_the_sandbox_image_pins() -> None:
+    """The catalogue's output format *is* rtk's output format.
+
+    A notebook on a different build measures a different format than the eval
+    harness will, which is the whole class of bug the pinned-toolchain rule exists
+    to prevent. So the notebook and the Dockerfile must name the same build.
+    """
+    joined = "\n".join(code_cells())
+    assert RTK_VERSION in joined
+    assert RTK_SHA256 in joined
+    dockerfile = (
+        build_notebook._project_root() / "docker" / "go-sandbox" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    assert RTK_VERSION in dockerfile, "the sandbox image pins a different rtk release"
+    assert RTK_SHA256 in dockerfile, "the sandbox image pins a different rtk digest"
+    assert RTK_ASSET in dockerfile, "the sandbox image downloads a different asset"
+
+
+def test_rtk_is_verified_against_the_publisher_as_well_as_the_pin() -> None:
+    """Two sources, the way the Dockerfile does it.
+
+    The pin says what was reviewed; the fetch proves the publisher still says so.
+    """
+    joined = "\n".join(code_cells())
+    assert "checksums.txt" in joined
+    install = joined.index('shutil.copy2(binary, "/usr/local/bin/rtk")')
+    assert joined.index("checksums.txt") < install, "rtk was installed before it was cross-checked"
+
+
+def test_the_notebook_refuses_an_architecture_its_pinned_binaries_do_not_cover() -> None:
+    """A static x86_64 musl build on arm64 fails at exec time, confusingly.
+
+    Colab's T4/L4/A100 are all x86_64, so this only fires on a machine the constants
+    do not describe -- which is exactly when a named refusal beats a stack trace
+    from deep inside a subprocess.
+    """
+    joined = "\n".join(code_cells())
+    assert "platform.machine()" in joined
+    assert joined.index("platform.machine()") < joined.index("go.dev/dl")
 
 
 def test_the_go_download_is_verified_before_it_is_used() -> None:
@@ -175,6 +222,15 @@ def test_the_go_toolchain_is_pinned_here_and_only_here() -> None:
     package = pathlib.Path(build_notebook.__file__).parent
     occurrences = sum(
         path.read_text(encoding="utf-8").count(GO_SHA256) for path in package.glob("*.py")
+    )
+    assert occurrences == 1
+
+
+def test_rtk_is_pinned_here_and_only_here_too() -> None:
+    """The same rule as the repo id and the Go digest, for the same reason."""
+    package = pathlib.Path(build_notebook.__file__).parent
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(RTK_SHA256) for path in package.glob("*.py")
     )
     assert occurrences == 1
 

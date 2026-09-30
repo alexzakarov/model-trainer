@@ -248,9 +248,17 @@ def test_grep_reports_no_match_as_a_failure(module: pathlib.Path) -> None:
 # --------------------------------------------------------- workspace tools
 
 
+@needs_rtk
 @needs_go
 def test_write_file_then_build_then_test(module: pathlib.Path) -> None:
-    """The whole repair loop, in the order a model would perform it."""
+    """The whole repair loop, in the order a model would perform it.
+
+    ``needs_rtk`` as well as ``needs_go``: ``go_test`` and ``go_build`` are RTK-backed
+    in the catalogue, so a Go that is present but an rtk that is not produces a
+    ``HARNESS_ERROR`` -- "rtk not found" -- where this test expects a red suite. A
+    test that needs both says both; declaring only one of them turns a missing
+    dependency into a red gate that reads as a broken project.
+    """
     (module / "parser" / "parser.go").write_text(BROKEN_SOURCE, encoding="utf-8")
     assert call("go_test", module, pkg="./...").status is Status.TOOL_ERROR
 
