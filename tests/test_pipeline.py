@@ -193,6 +193,20 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         run_gate=True,
         run_device_check=True,
         run_token_check=True,
+        run_repo=True,
+        run_tasks=True,
+        log_root=tmp_path / "logs",
+        model_name="policy",
+        revision="sft-8192",
+        dataset_version="go-ut-bench-val",
+        repo_url="https://example.invalid/repo.git",
+        repo_name="example/repo",
+        repo_dir=tmp_path / "repo",
+        task_limit=8,
+        vllm_port=8000,
+        serve_timeout=5,
+        serve=True,
+        serve_command=["python", "-m", "vllm.entrypoints.openai.api_server"],
         run_corpus=True,
         run_data=True,
         run_sft=True,
@@ -420,6 +434,244 @@ def test_a_token_that_is_present_is_reported_not_echoed(
     assert not any("hf_this_must_not_be_printed" in line for line in lines), lines
 
 
+def test_cloning_reuses_a_checkout_that_is_already_there(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running the chain is normal, and re-cloning is not.
+
+    The task builder reads whatever is in that directory, so an existing *checkout* is
+    reused and anything else is refused. A silent reuse of a directory that is not a
+    checkout would build tasks against whatever happened to be there.
+    """
+    directory = tmp_path / "repo"
+    (directory / ".git").mkdir(parents=True)
+    called: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        pipe, "stream_command", lambda command, log, emit: called.append(tuple(command)) or 0
+    )
+    lines: list[str] = []
+    assert pipe._clone_repository(options(tmp_path, repo_dir=directory), lines.append) == 0
+    assert called == [], "it cloned over a checkout that was already there"
+    assert any("already cloned" in line for line in lines), lines
+
+
+def test_a_directory_that_is_not_a_checkout_is_refused(tmp_path: pathlib.Path) -> None:
+    """Otherwise the tasks are built from whatever is in that directory."""
+    directory = tmp_path / "repo"
+    directory.mkdir()
+    (directory / "some-file.txt").write_text("someone's work", encoding="utf-8")
+    with pytest.raises(DatasetError, match="not a git checkout"):
+        pipe._clone_repository(options(tmp_path, repo_dir=directory), lambda m: None)
+
+
+def test_a_fresh_clone_is_shallow_and_names_the_repository(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The task builder reads the working tree, not the history.
+
+    Fetching a decade of commits would cost minutes and buy nothing.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    def record(command: Any, log: Any, emit: Any) -> int:
+        calls.append(tuple(str(part) for part in command))
+        return 0
+
+    monkeypatch.setattr(pipe, "stream_command", record)
+    assert pipe._clone_repository(options(tmp_path), lambda m: None) == 0
+    assert calls[0][:2] == ("git", "clone")
+    assert "--depth" in calls[0], "a shallow clone, because only the tree is read"
+    assert "https://example.invalid/repo.git" in calls[0]
+
+
+def test_the_server_is_stopped_even_when_sampling_fails(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server left running holds the card the preference run needs next.
+
+    That run fits two whole models on it, and the failure mode -- a successful
+    evaluation followed by an out-of-memory error that has nothing to do with memory --
+    is one nobody would attribute to a leaked process.
+    """
+    terminated: list[bool] = []
+
+    class FakeServer:
+        """A server that stays up until it is terminated.
+
+        ``poll`` returning a number means the process has *exited*; ``None`` means it is
+        still running. Getting that backwards sends the readiness loop down the
+        died-early branch on a server that is fine.
+        """
+
+        def poll(self) -> int | None:
+            return 0 if terminated else None
+
+        def terminate(self) -> None:
+            terminated.append(True)
+
+        def wait(self, timeout: int = 0) -> int:
+            return 0
+
+    monkeypatch.setattr(pipe.subprocess, "Popen", lambda *a, **k: FakeServer())
+    monkeypatch.setattr(pipe, "stream_command", lambda *a, **k: 7)
+    # Ready immediately, so the readiness loop breaks and sampling runs (and fails).
+    # Patched on the real module, because the function imports it where it uses it.
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Ready())
+
+    code = pipe._serve_and_generate(options(tmp_path), lambda m: None)
+    assert code == 7, "the sampling exit code was not passed on"
+    assert terminated, "the server was left running"
+
+
+class _Ready:
+    """A minimal stand-in for the readiness response."""
+
+    status = 200
+
+    def read(self) -> bytes:
+        return b"{}"
+
+    def __enter__(self) -> _Ready:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def test_a_server_that_dies_prints_its_own_reason(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first attempt reported "the server exited 1" and nothing else.
+
+    Its output had been sent to DEVNULL, so the reason was destroyed before anyone
+    could read it. The tail has to be in the failure, because there is nowhere else the
+    reason exists.
+    """
+    log_root = tmp_path / "logs"
+    log_root.mkdir(parents=True)
+
+    class DeadServer:
+        """A server that writes a reason and then exits, as a real one does."""
+
+        returncode = 1
+
+        def __init__(self, argv: Any, stdout: Any = None, stderr: Any = None) -> None:
+            # The stage opens the log before this is constructed, so the reason has to
+            # arrive through the handle it was given rather than being pre-written.
+            if stdout is not None:
+                stdout.write("CUDA out of memory\narchitectures not supported\n")
+                stdout.flush()
+
+        def poll(self) -> int:
+            return 1
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: int = 0) -> int:
+            return 1
+
+    monkeypatch.setattr(pipe.subprocess, "Popen", DeadServer)
+    lines: list[str] = []
+    with pytest.raises(DatasetError, match="exited 1 before it was ready"):
+        pipe._serve_and_generate(options(tmp_path, log_root=log_root), lines.append)
+    joined = "\n".join(lines)
+    assert "not supported" in joined, "the server's own reason was not shown"
+
+
+def test_an_externally_served_model_is_used_without_starting_anything(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--no-serve is for a host where the server already runs.
+
+    Starting another would fail on the port, and a port conflict reads like a model
+    problem to whoever is looking at it.
+    """
+    started: list[bool] = []
+    monkeypatch.setattr(pipe.subprocess, "Popen", lambda *a, **k: started.append(True))
+    monkeypatch.setattr(pipe, "stream_command", lambda *a, **k: 0)
+    lines: list[str] = []
+    code = pipe._serve_and_generate(options(tmp_path, serve=False), lines.append)
+    assert code == 0
+    assert started == [], "a server was started despite --no-serve"
+    assert any("already" in line for line in lines), lines
+
+
+def test_a_server_that_never_becomes_ready_gives_up_and_says_so(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Waiting forever is worse than failing: the reader has no idea whether to wait.
+
+    Loading a 4B checkpoint is silent for minutes, so the loop reports what the server
+    last said while it tries -- otherwise "still loading" and "wedged" look identical,
+    and the next move would be killing a process that was working.
+    """
+    import urllib.request
+
+    terminated: list[bool] = []
+
+    class LoadingServer:
+        def poll(self) -> int | None:
+            return None
+
+        def terminate(self) -> None:
+            terminated.append(True)
+
+        def wait(self, timeout: int = 0) -> int:
+            return 0
+
+    monkeypatch.setattr(pipe.subprocess, "Popen", lambda *a, **k: LoadingServer())
+
+    def never_ready(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", never_ready)
+
+    # Time is the thing under test, so it is driven rather than waited on. It starts
+    # past the reporting interval so the first pass has something to say.
+    clock = {"now": 100.0}
+    monkeypatch.setattr(pipe.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        pipe.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds)
+    )
+
+    lines: list[str] = []
+    with pytest.raises(DatasetError, match="was not ready in"):
+        pipe._serve_and_generate(options(tmp_path, serve_timeout=20), lines.append)
+    assert terminated, "the server was left running after the wait gave up"
+    assert any("loading" in line for line in lines), lines
+
+
+def test_a_named_revision_is_used_as_given(tmp_path: pathlib.Path) -> None:
+    """The revision is what stops a resumed run from reusing stale samples.
+
+    It keys the store, so a run that changed checkpoint but kept the key would grade
+    itself against results from a model that is not the one being trained. Left unset
+    it is derived from the context length; given, it is left alone, because a name
+    someone chose is not a value to second-guess.
+    """
+    assert (
+        pipe.main(
+            [
+                "--dry-run",
+                "--no-device",
+                "--no-token",
+                "--no-gate",
+                "--no-corpus",
+                "--no-data",
+                "--no-sft",
+                "--no-eval",
+                "--no-dpo",
+                "--revision",
+                "my-checkpoint",
+            ]
+        )
+        == 0
+    )
+
+
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:
     """Each stage consumes what the one before it produced.
 
@@ -437,8 +689,9 @@ def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.
         "corpus",
         "sft-data",
         "sft",
-        "eval-queue",
-        "eval-judge",
+        "repo",
+        "tasks",
+        "eval",
         "preferences",
         "dpo",
     ]
@@ -453,7 +706,7 @@ def test_a_switched_off_stage_disappears_from_the_chain(tmp_path: pathlib.Path) 
         stage.name for stage in pipe.build_stages(options(tmp_path, run_eval=False, run_dpo=False))
     ]
     assert names == ["device", "token", "quality-gate", "corpus", "sft-data", "sft"]
-    assert not any("eval" in name or "dpo" in name or name == "preferences" for name in names)
+    assert not any(name in {"repo", "tasks", "eval", "preferences", "dpo"} for name in names)
 
 
 def test_the_supervised_stage_carries_what_the_memory_work_established(
@@ -465,7 +718,7 @@ def test_the_supervised_stage_carries_what_the_memory_work_established(
     the budget is what turns that into a message instead of a crash.
     """
     stage = next(s for s in pipe.build_stages(options(tmp_path)) if s.name == "sft")
-    command = " ".join(stage.command)
+    command = " ".join(str(part) for part in stage.command)
     assert "--gradient-checkpointing" in command
     assert "--loss-mode selective" in command
     assert "--optimizer adafactor" in command
@@ -481,7 +734,10 @@ def test_the_preference_stage_starts_from_the_checkpoint_it_was_built_on(
     It compares against a frozen copy of the model being trained, so pointing it at
     the base model would optimise towards the wrong thing.
     """
-    stages = {s.name: " ".join(s.command) for s in pipe.build_stages(options(tmp_path))}
+    stages = {
+        s.name: " ".join(str(part) for part in s.command)
+        for s in pipe.build_stages(options(tmp_path))
+    }
     assert "--model" in stages["dpo"]
     assert str(tmp_path / "sft") in stages["dpo"]
     assert "traincli dpo" in stages["dpo"]
@@ -492,10 +748,19 @@ def test_the_evaluation_stage_samples_more_than_once(tmp_path: pathlib.Path) -> 
     """A preference needs one attempt that passed and one that failed.
 
     With a single sample there is no contrast, so `preferences` returns nothing and
-    the chain stops for a reason that has nothing to do with the model.
+    the chain stops for a reason that has nothing to do with the model. The sampling
+    command is built inside the evaluation stage rather than in the plan, because the
+    stage has to run it while the server it started is still alive -- so the assertion
+    is on that function's own argv.
     """
-    stages = {s.name: " ".join(s.command) for s in pipe.build_stages(options(tmp_path))}
-    assert "--n-samples 4" in stages["eval-queue"]
+    import inspect
+
+    source = inspect.getsource(pipe._serve_and_generate)
+    assert '"--n-samples"' in source and "options.n_samples" in source
+    stages = {
+        s.name: " ".join(str(part) for part in s.command)
+        for s in pipe.build_stages(options(tmp_path))
+    }
     assert "--n-samples" in stages["preferences"]
 
 
@@ -505,9 +770,15 @@ def test_the_evaluation_runs_locally_because_colab_has_no_docker(tmp_path: pathl
     That flag is a real risk on someone's own machine; in a disposable Colab VM it is
     the difference between a stage that runs and one that cannot.
     """
-    stages = {s.name: " ".join(s.command) for s in pipe.build_stages(options(tmp_path))}
-    assert "--sandbox local" in stages["eval-queue"]
-    assert "--allow-local-execution" in stages["eval-queue"]
+    import inspect
+
+    source = inspect.getsource(pipe._serve_and_generate)
+    assert '"--sandbox"' in source and '"local"' in source
+    assert '"--allow-local-execution"' in source, "the sandbox choice is explicit"
+    # And the model served is the checkpoint this run produced, not the base.
+    assert (
+        '"--model",\n                options.sft_output' in source or "options.sft_output" in source
+    )
 
 
 def test_publish_flags_are_passed_through_rather_than_duplicated(tmp_path: pathlib.Path) -> None:
@@ -521,8 +792,12 @@ def test_publish_flags_are_passed_through_rather_than_duplicated(tmp_path: pathl
         for s in pipe.build_stages(options(tmp_path, extra_sft=["--hub-repo-id", "a/b"]))
         if s.name == "sft"
     )
-    assert "--hub-repo-id a/b" in " ".join(stage.command)
-    others = [" ".join(s.command) for s in pipe.build_stages(options(tmp_path)) if s.name != "sft"]
+    assert "--hub-repo-id a/b" in " ".join(str(part) for part in stage.command)
+    others = [
+        " ".join(str(part) for part in s.command)
+        for s in pipe.build_stages(options(tmp_path))
+        if s.name != "sft"
+    ]
     assert not any("--hub-repo-id" in command for command in others)
 
 
@@ -699,8 +974,10 @@ def test_every_flag_the_pipeline_passes_is_one_the_cli_defines(tmp_path: pathlib
         if "-m" not in stage.command:
             continue  # an in-process stage runs here; it has no command line to check
         index = stage.command.index("-m")
-        module_name = stage.command[index + 1]
-        rest = stage.command[index + 2 :]
+        module_name = str(stage.command[index + 1])
+        # str() because a stage may carry a Path for a repository or a task file, and
+        # the question here is about flags, not about what a value is made of.
+        rest = [str(part) for part in stage.command[index + 2 :]]
         subcommand = rest[0] if rest and not rest[0].startswith("-") else ""
         for position, token in enumerate(rest):
             if not token.startswith("--"):

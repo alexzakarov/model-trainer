@@ -106,7 +106,7 @@ class Pipeline:
         self.log_root.mkdir(parents=True, exist_ok=True)
         for stage in self.stages:
             if dry_run:
-                self.emit(f"[dry] {stage.name}: {' '.join(stage.command)}")
+                self.emit(f"[dry] {stage.name}: {' '.join(str(part) for part in stage.command)}")
                 continue
             code = self._run_in_process(stage) if stage.run is not None else self._one(stage)
             if code != 0 and stage.fatal:
@@ -154,34 +154,10 @@ class Pipeline:
         log_path = self.log_root / f"{stage.name}.log"
         started = time.monotonic()
         self.emit(f"\n=== {stage.name} ===")
-        self.emit(f"$ {' '.join(stage.command)}")
-        # Unbuffered, so a stage that prints before its first step still says so.
-        command = (
-            (sys.executable, "-u", *stage.command[1:])
-            if stage.command[0] == "python"
-            else stage.command
-        )
-        with log_path.open("w", encoding="utf-8", buffering=1) as log:
-            # Every element comes from this module's own stage table or from the
-            # operator's command line, never from a dataset or a downloaded file --
-            # which is the distinction ruff's S603 is asking about. A task file's
-            # contents are arguments to `gotooltrain`, not to this.
-            process = subprocess.Popen(  # noqa: S603 - argv is constructed here, not parsed from data
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            stdout = process.stdout
-            if stdout is None:
-                # Only reachable if the pipe above were removed; failing here beats
-                # iterating None and reporting it as a silent empty log.
-                raise DatasetError("the stage's output pipe was not created")
-            for line in stdout:
-                self.emit(line.rstrip("\n"))
-                log.write(line)
-            code = process.wait()
+        # str() because a stage may carry a Path; the command is printed for a reader,
+        # and Popen does not need the conversion itself.
+        self.emit(f"$ {' '.join(str(part) for part in stage.command)}")
+        code = self.stream(stage.command, log_path)
         seconds = time.monotonic() - started
         self.results.append(StageResult(stage.name, code, seconds, log_path))
         if code != 0:
@@ -191,6 +167,10 @@ class Pipeline:
         else:
             self.emit(f"--- {stage.name} bitti ({seconds:.1f}s) ---")
         return code
+
+    def stream(self, command: Sequence[str], log_path: pathlib.Path) -> int:
+        """Run a command, printing each line as it arrives and keeping them all."""
+        return stream_command(command, log_path, self.emit)
 
     def summary(self) -> str:
         """A compact record of what ran, in the order it ran."""
@@ -263,6 +243,41 @@ def _hub_listing(repo_id: str) -> Iterable[str]:
 
     files: Iterable[str] = HfApi().list_repo_files(repo_id)
     return files
+
+
+def stream_command(
+    command: Sequence[str], log_path: pathlib.Path, emit: Callable[[str], None]
+) -> int:
+    """Run a command, printing each line as it arrives and keeping them all.
+
+    Module level rather than only a method because the evaluation stage runs commands
+    inside itself -- the model server it starts has to be alive while its samples are
+    generated -- and a second copy of this loop would be a second place for the
+    buffering, the log and the exit code to be got wrong.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Unbuffered, so a command that prints before its first step still says so.
+    argv = (sys.executable, "-u", *command[1:]) if command[0] == "python" else tuple(command)
+    with log_path.open("w", encoding="utf-8", buffering=1) as log:
+        # Every element comes from this module's own stage table or from the operator's
+        # command line, never from a dataset or a downloaded file -- which is the
+        # distinction ruff's S603 is asking about.
+        process = subprocess.Popen(  # noqa: S603 - argv is constructed here, not parsed from data
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        stdout = process.stdout
+        if stdout is None:
+            # Only reachable if the pipe above were removed; failing here beats
+            # iterating None and reporting it as a silent empty log.
+            raise DatasetError("the stage's output pipe was not created")
+        for line in stdout:
+            emit(line.rstrip("\n"))
+            log.write(line)
+        return process.wait()
 
 
 def tail(path: pathlib.Path, lines: int) -> list[str]:
@@ -433,6 +448,170 @@ def _check_device(options: argparse.Namespace, emit: Callable[[str], None]) -> i
     return 0
 
 
+def _clone_repository(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
+    """Fetch the repository the evaluation tasks are built from.
+
+    A task needs a repository state to be worked in and a command that decides whether
+    the work succeeded; ``gotooltrain-data tasks`` produces both from a checkout. So the
+    checkout is the first thing the preference chain needs and the first thing that can
+    be missing.
+
+    Shallow: the task builder reads the working tree, not the history, so fetching a
+    decade of commits would cost minutes and buy nothing. Already cloned is not an
+    error -- re-running the chain is normal -- but a directory that exists and is *not*
+    a checkout is, because the task builder would then read whatever is there.
+    """
+    directory = pathlib.Path(options.repo_dir)
+    if directory.is_dir():
+        if (directory / ".git").exists():
+            emit(f"repository: {directory} already cloned, reusing it")
+            return 0
+        raise DatasetError(
+            f"{directory} exists and is not a git checkout. Point --repo-dir somewhere "
+            "else, or remove it: the task builder reads this directory, and reading "
+            "whatever happens to be there would build tasks against the wrong source."
+        )
+
+    emit(f"repository: cloning {options.repo_url} (shallow) into {directory}")
+    return stream_command(
+        ("git", "clone", "--depth", "1", options.repo_url, str(directory)),
+        pathlib.Path(options.log_root) / "repo.log",
+        emit,
+    )
+
+
+def _serve_and_generate(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
+    """Serve the trained checkpoint, sample from it, then stop the server.
+
+    The evaluation is the only stage that needs two processes at once: the agent loop
+    asks a model server for completions and runs the Go it produces. The server is
+    started here, waited for, and stopped in a ``finally`` -- a server left running
+    would hold the card for the preference-optimisation stage that follows, which fits
+    two whole models on it.
+
+    The server's output goes to its own file, and the tail is printed when it dies.
+    That is not a detail: the first attempt at this sent the server's output to
+    ``DEVNULL`` and then reported "the server exited 1", which is the entire content of
+    the failure and none of the reason.
+    """
+    import urllib.error
+    import urllib.request
+
+    server_log = pathlib.Path(options.log_root) / "server.log"
+    # Created here, not assumed: on a fresh run nothing has made the log directory yet,
+    # and the failure for that would be a FileNotFoundError inside the branch that was
+    # supposed to start a server.
+    server_log.parent.mkdir(parents=True, exist_ok=True)
+    server: Any = None
+    try:
+        if options.serve:
+            # The model is the checkpoint this run just produced, not the base: a
+            # preference pair has to come from the policy being improved, or it ranks
+            # attempts the run never made.
+            serve_argv = [
+                *options.serve_command,
+                "--model",
+                options.sft_output,
+                "--port",
+                str(options.vllm_port),
+                "--served-model-name",
+                options.model_name,
+                "--max-model-len",
+                str(options.context_length),
+                "--gpu-memory-utilization",
+                "0.85",
+            ]
+            emit(f"server: starting on port {options.vllm_port}")
+            server = subprocess.Popen(  # noqa: S603 - argv comes from this module's options
+                serve_argv,
+                stdout=server_log.open("w", encoding="utf-8", buffering=1),
+                stderr=subprocess.STDOUT,
+            )
+            deadline = time.monotonic() + options.serve_timeout
+            last_report = 0.0
+            while time.monotonic() < deadline:
+                if server.poll() is not None:
+                    emit(f"--- {server_log} (last 40 lines) ---")
+                    for line in tail(server_log, 40):
+                        emit(f"  {line}")
+                    raise DatasetError(
+                        f"the model server exited {server.returncode} before it was ready. "
+                        "Its reason is above; without it there is nothing to sample from, "
+                        "and an evaluation with no samples produces no preference pair."
+                    )
+                try:
+                    # The URL is the operator's own --model-url, defaulting to
+                    # localhost. It is not built from a dataset.
+                    with urllib.request.urlopen(  # noqa: S310 - the operator's own endpoint
+                        f"{options.model_url}/models", timeout=2
+                    ) as response:
+                        emit(f"server: ready ({response.status})")
+                        break
+                except (urllib.error.URLError, TimeoutError, OSError):
+                    # Loading a 4B checkpoint is silent for minutes; silence reads as a
+                    # hang, and the next move would be killing a process that was working.
+                    if time.monotonic() - last_report > 30:
+                        last_report = time.monotonic()
+                        # The server may not have printed anything yet, so the last line
+                        # is optional. Indexing it blindly would raise from inside the
+                        # wait -- turning "still starting" into a crash.
+                        said = tail(server_log, 1)
+                        emit(f"  ...loading (server log: {said[-1][:110] if said else 'empty'})")
+                    time.sleep(5)
+            else:
+                raise DatasetError(
+                    f"the model server was not ready in {options.serve_timeout}s; {server_log} "
+                    "has what it said while it tried."
+                )
+        else:
+            emit(f"server: --no-serve, assuming one is already at {options.model_url}")
+
+        code = stream_command(
+            (
+                "python",
+                "-m",
+                "gotooltrain.evalcli",
+                "queue",
+                "--store",
+                options.store,
+                "--tasks",
+                options.tasks,
+                "--model",
+                options.model_name,
+                "--revision",
+                options.revision,
+                "--dataset-version",
+                options.dataset_version,
+                "--n-samples",
+                str(options.n_samples),
+                "--model-url",
+                options.model_url,
+                "--out",
+                str(options.queue_file),
+                "--fixture",
+                options.repo_dir,
+                "--workspace",
+                str(pathlib.Path(options.log_root) / "workspaces"),
+                "--sandbox",
+                "local",
+                "--allow-local-execution",
+            ),
+            pathlib.Path(options.log_root) / "eval-queue.log",
+            emit,
+        )
+        if code != 0:
+            emit("--- the sampling stage did not finish; no pairs can come from it ---")
+        return code
+    finally:
+        if server is not None and server.poll() is None:
+            emit("server: stopping it now, so the next stage has the card to itself")
+            server.terminate()
+            try:
+                server.wait(timeout=30)
+            except subprocess.TimeoutExpired:  # pragma: no cover - a hung server on a real host
+                server.kill()
+
+
 def _write_sft_data(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
     """Prepare the training corpus from the options this run was given.
 
@@ -558,63 +737,57 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                 ),
             )
         )
-    if options.run_eval:
-        # Two commands, not one: the agent loop writes trajectories, and the judge
-        # ingests verdicts into the store. `preferences` reads the store, so both
-        # have to have run before a pair can exist.
+    # The task file the evaluation reads has to be built, and it is built from a
+    # checkout: a task is a repository state plus the command that decides whether the
+    # work succeeded. Nothing produced either before this, so `--tasks` named a file
+    # that did not exist and the evaluation could not have started.
+    # Cloning and task-building exist only to feed the evaluation, so they follow it:
+    # switching the evaluation off is also a decision not to fetch a repository
+    # nothing will read.
+    if options.run_eval and options.run_repo:
         stages.append(
             Stage(
-                "eval-queue",
+                "repo",
+                ("in-process", f"clone {options.repo_name} for the evaluation tasks"),
+                run=lambda emit: _clone_repository(options, emit),
+            )
+        )
+    if options.run_eval and options.run_tasks:
+        stages.append(
+            Stage(
+                "tasks",
                 (
                     "python",
                     "-m",
-                    "gotooltrain.evalcli",
-                    "queue",
-                    "--store",
-                    options.store,
-                    "--tasks",
-                    options.tasks,
-                    "--model",
-                    options.model,
-                    "--revision",
-                    f"sft-{options.context_length}",
-                    "--dataset-version",
-                    "go-ut-bench-val",
-                    "--n-samples",
-                    str(options.n_samples),
-                    "--model-url",
-                    options.model_url,
+                    "gotooltrain.datacli",
+                    "tasks",
+                    "--repository",
+                    options.repo_dir,
+                    "--repository-name",
+                    options.repo_name,
                     "--out",
-                    str(options.queue_file),
-                    "--sandbox",
-                    "local",
-                    "--allow-local-execution",
+                    options.tasks,
+                    "--limit",
+                    str(options.task_limit),
                 ),
             )
         )
+
+    if options.run_eval:
+        # One stage, because it is the only thing here that needs two processes at
+        # once: the agent loop asks a model server for completions and runs the Go it
+        # produces. The server is started and stopped inside the stage, so it cannot
+        # leak into the preference run that follows and needs the whole card.
+        #
+        # There is deliberately no `eval-judge` stage. The execution reward reads the
+        # tool outcomes out of the store that `queue` writes; `judge` ingests
+        # LLM-judged verdicts from a file, and nothing in this chain produces one. A
+        # stage that asks for a file nothing writes is a stage that cannot run.
         stages.append(
             Stage(
-                "eval-judge",
-                (
-                    "python",
-                    "-m",
-                    "gotooltrain.evalcli",
-                    "judge",
-                    "--store",
-                    options.store,
-                    "--tasks",
-                    options.tasks,
-                    "--model",
-                    options.model,
-                    "--revision",
-                    f"sft-{options.context_length}",
-                    "--dataset-version",
-                    "go-ut-bench-val",
-                    "--queue",
-                    str(options.queue_file),
-                    "--verdicts",
-                    str(options.verdicts),
-                ),
+                "eval",
+                ("in-process", "serve the checkpoint, then sample with the agent loop"),
+                run=lambda emit: _serve_and_generate(options, emit),
             )
         )
         stages.append(
@@ -630,11 +803,11 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                     "--tasks",
                     options.tasks,
                     "--model",
-                    options.model,
+                    options.model_name,
                     "--revision",
-                    f"sft-{options.context_length}",
+                    options.revision,
                     "--dataset-version",
-                    "go-ut-bench-val",
+                    options.dataset_version,
                     "--n-samples",
                     str(options.n_samples),
                     "--out",
@@ -644,6 +817,7 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                 ),
             )
         )
+
     if options.run_dpo:
         stages.append(
             Stage(
@@ -753,6 +927,27 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--store", default="runs/eval-store")
     parser.add_argument("--model-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--queue-file", default="runs/eval-queue.jsonl", type=pathlib.Path)
+    parser.add_argument("--log-root", default=str(LOG_ROOT), type=pathlib.Path)
+    # The evaluation samples from a served checkpoint. The revision keys the store, so
+    # a resumed run reuses exactly the samples it already paid for.
+    parser.add_argument("--model-name", default="policy", help="the name the server serves under")
+    parser.add_argument(
+        "--revision", default=None, help="the checkpoint revision keyed in the store"
+    )
+    parser.add_argument("--dataset-version", default="go-ut-bench-val")
+    parser.add_argument("--repo-url", default="https://github.com/gin-gonic/gin.git")
+    parser.add_argument("--repo-name", default="gin-gonic/gin")
+    parser.add_argument("--repo-dir", default="runs/eval-repo", type=pathlib.Path)
+    parser.add_argument("--task-limit", type=int, default=8, help="cap packages, 0 for all")
+    parser.add_argument("--vllm-port", type=int, default=8000)
+    parser.add_argument("--serve-timeout", type=int, default=1800)
+    parser.add_argument("--no-serve", action="store_true", help="assume a server is already up")
+    parser.add_argument(
+        "--serve-command",
+        nargs=argparse.REMAINDER,
+        default=["python", "-m", "vllm.entrypoints.openai.api_server"],
+        help="the server to sample from; its remaining flags are built from the other options",
+    )
     parser.add_argument("--verdicts", default="runs/eval-verdicts.jsonl", type=pathlib.Path)
     parser.add_argument("--context-length", type=int, default=8192)
     parser.add_argument("--memory-budget-gb", type=float, default=40.0)
@@ -799,6 +994,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-corpus", action="store_true")
     parser.add_argument("--no-device", action="store_true")
     parser.add_argument("--no-token", action="store_true")
+    parser.add_argument("--no-repo", action="store_true")
+    parser.add_argument("--no-tasks", action="store_true")
     parser.add_argument("--no-data", action="store_true")
     parser.add_argument("--no-sft", action="store_true")
     parser.add_argument("--no-eval", action="store_true")
@@ -820,6 +1017,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_corpus=not args.no_corpus,
         run_device_check=not args.no_device,
         run_token_check=not args.no_token,
+        run_repo=not args.no_repo,
+        run_tasks=not args.no_tasks,
         run_data=not args.no_data,
         run_sft=not args.no_sft,
         run_eval=not args.no_eval,
@@ -827,6 +1026,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         extra_sft=list(args.extra_sft),
         extra_dpo=list(args.extra_dpo),
     )
+    # The revision names the checkpoint in the store's content key. Left unset it is
+    # derived from the context length, so two runs at different lengths never share
+    # stored samples -- which would silently reuse results from a model that is not the
+    # one being graded.
+    if values["revision"] is None:
+        values["revision"] = f"sft-{values['context_length']}"
     options = argparse.Namespace(**values)
 
     # `auto` is resolved here, in code that is tested, rather than in the
