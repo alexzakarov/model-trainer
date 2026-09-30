@@ -28,7 +28,7 @@ from .hub import HUB_TOKEN_ENV, HubPushPolicy
 from .normalize import normalize_conversation
 from .reward import PreferencePair
 from .template import load_template_source
-from .train import CONTEXT_LENGTH, OptimisationPlan, train
+from .train import CONTEXT_LENGTH, DEFAULT_MEMORY_BUDGET_GB, OptimisationPlan, train
 from .vision import VISION_PAD_TOKEN
 
 DEFAULT_TOKENIZER: str = "Qwen/Qwen3.5-4B"
@@ -94,6 +94,8 @@ def _plan(args: argparse.Namespace) -> OptimisationPlan:
         train_vision_tower=not args.freeze_vision,
         gradient_checkpointing=args.gradient_checkpointing,
         optimizer=args.optimizer,
+        memory_budget_gb=args.memory_budget_gb,
+        loss_mode=args.loss_mode,
         hub=_hub_policy(args),
     )
 
@@ -112,7 +114,29 @@ def _add_shared(parser: argparse.ArgumentParser) -> None:
         "--max-length",
         type=int,
         default=CONTEXT_LENGTH,
-        help="context; records longer than this are refused, never truncated",
+        help=(
+            "context; records longer than this are refused, never truncated. Fitted "
+            "against --memory-budget-gb before the first step"
+        ),
+    )
+    parser.add_argument(
+        "--memory-budget-gb",
+        type=float,
+        default=DEFAULT_MEMORY_BUDGET_GB,
+        help=(
+            "the card this run is fitted against. The estimate is printed either way and "
+            "the run refuses to start if it does not fit (default: "
+            f"{DEFAULT_MEMORY_BUDGET_GB:.0f})"
+        ),
+    )
+    parser.add_argument(
+        "--loss-mode",
+        default="selective",
+        choices=("selective", "builtin"),
+        help=(
+            "selective projects the vocabulary only at supervised positions -- the same "
+            "arithmetic on 3x less memory; builtin lets the model compute the loss itself"
+        ),
     )
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--seed", type=int, default=0)

@@ -40,7 +40,7 @@ import json
 import math
 import random
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -57,6 +57,7 @@ from .hub import (
     write_push_state,
 )
 from .schema import FORMAT_VERSION
+from .template import IGNORED_INDEX
 
 #: The target context length. Not a max: examples longer than this are refused
 #: rather than truncated, because a truncated assistant span is supervised
@@ -76,10 +77,245 @@ DEFAULT_EPOCHS: Final[int] = 3
 #: possible at all, which is what proves the loop runs before a GPU day is spent.
 DTYPES: Final[tuple[str, ...]] = ("bfloat16", "float16", "float32")
 
+#: Bytes in a gibibyte, so the arithmetic above reads in the unit the budget is
+#: stated in rather than in a scale factor repeated at every division.
+_GB: Final[float] = float(1024**3)
+
 #: Optimiser families a run may use. Adafactor keeps no first moment and factors
 #: the second, so its state is a few megabytes instead of a few gigabytes; on a
 #: single card that is often the difference between fitting and not.
 OPTIMIZERS: Final[tuple[str, ...]] = ("adamw", "adafactor")
+
+#: The card a run is fitted against unless told otherwise, in gigabytes.
+#:
+#: A full fine-tune in bf16 holds the weights and one gradient per parameter
+#: resident no matter what is done about the rest: a 4.33B model is 17.4 GB before
+#: a single activation exists. That floor is what makes the budget worth stating --
+#: it cannot be optimised away, only planned around.
+DEFAULT_MEMORY_BUDGET_GB: Final[float] = 40.0
+
+#: How the loss is computed. Both are exact; they differ only in how much of the
+#: vocabulary projection is materialised at once.
+#:
+#: ``selective`` runs the backbone, keeps only the positions that carry a label, and
+#: projects *those* through the vocabulary head. The arithmetic is identical to the
+#: built-in loss -- same shift, same ignored index, same mean -- but the logits
+#: tensor is [supervised_positions, vocab] instead of [sequence, vocab]. Measured
+#: on this project's own corpus the supervised share is 32%, so that is a 3.1x cut
+#: on the single largest term in the budget.
+#:
+#: ``builtin`` hands the whole thing to the model. It is the escape hatch for a
+#: checkpoint whose backbone does not expose hidden states separately; it costs the
+#: full projection, and the plan records that it was chosen.
+LOSS_MODES: Final[tuple[str, ...]] = ("selective", "builtin")
+
+#: Bytes per intermediate activation tensor of shape [tokens, hidden] in bf16.
+_ACTIVATION_BYTES: Final[int] = 2
+
+#: How many such tensors one layer holds beyond its attention state. An estimate,
+#: and labelled as one: the point of the budget is to stop a run starting on a card
+#: it cannot fit, not to predict the allocator to the megabyte.
+_INTERMEDIATES_PER_LAYER: Final[float] = 8.0
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryBudget:
+    """What a run is expected to hold, term by term, in gigabytes.
+
+    Returned rather than printed and forgotten, so a run that then dies on an OOM
+    can be compared against what was predicted. The split matters: a reader who
+    knows the terms can see *which* knob moves the answer, and a reader given one
+    total can only guess.
+    """
+
+    weights: float
+    gradients: float
+    optimiser: float
+    stored_activations: float
+    transient_activations: float
+    loss: float
+    context_length: int
+    loss_mode: str
+
+    @property
+    def resident(self) -> float:
+        """What cannot be traded away: weights, gradients and optimiser state."""
+        return self.weights + self.gradients + self.optimiser
+
+    @property
+    def total(self) -> float:
+        """The whole estimate."""
+        return self.resident + self.stored_activations + self.transient_activations + self.loss
+
+    def fits(self, budget_gb: float) -> bool:
+        """Whether the estimate is inside the budget."""
+        return self.total <= budget_gb
+
+    def to_record(self) -> dict[str, Any]:
+        """Serialisable form, for the training plan."""
+        return {
+            "context_length": self.context_length,
+            "loss_mode": self.loss_mode,
+            "resident_gb": round(self.resident, 2),
+            "stored_activations_gb": round(self.stored_activations, 2),
+            "transient_activations_gb": round(self.transient_activations, 2),
+            "loss_gb": round(self.loss, 2),
+            "total_gb": round(self.total, 2),
+        }
+
+    def report(self) -> str:
+        """A readable breakdown, so the arithmetic is reviewable by a human."""
+        return (
+            f"memory estimate @ {self.context_length} ctx, {self.loss_mode} loss\n"
+            f"    weights              {self.weights:7.2f} GB  (resident)\n"
+            f"    gradients            {self.gradients:7.2f} GB  (resident)\n"
+            f"    optimiser state      {self.optimiser:7.2f} GB  (resident)\n"
+            f"    stored activations   {self.stored_activations:7.2f} GB\n"
+            f"    transient activat.   {self.transient_activations:7.2f} GB\n"
+            f"    vocabulary loss      {self.loss:7.2f} GB\n"
+            f"    {'total':<20} {self.total:7.2f} GB"
+        )
+
+
+def completion_only_loss(model: Any, inputs: Mapping[str, Any], labels: Any) -> Any:
+    """The training loss, computed without materialising the whole vocabulary.
+
+    Mathematically identical to passing ``labels=`` to the model: the same causal
+    shift, the same ignored index, the same mean over supervised positions. The
+    only difference is *when* the vocabulary projection happens. Here the backbone
+    runs first, the positions that carry a label are selected, and the head is
+    applied to those alone -- so the logits tensor is
+    ``[supervised_positions, vocab]`` rather than ``[sequence, vocab]``.
+
+    Why it matters, measured on this project's own corpus: the vocabulary is 248,320
+    and only 32% of positions are supervised, so the selective form is 3.1x smaller
+    on the single largest term in the budget. On a 4B model that is the difference
+    between fitting a 40 GB card and not.
+
+    Raises rather than guessing when the checkpoint does not have this shape: a
+    silent fallback to the full projection would cost exactly the memory this
+    function exists to save, and nothing would say so.
+    """
+    import torch.nn.functional as functional
+
+    backbone = getattr(model, "model", None)
+    head = getattr(model, "lm_head", None)
+    if backbone is None or head is None:
+        raise DatasetError(
+            "selective loss needs a checkpoint that separates the backbone from the "
+            "vocabulary head (model.model and model.lm_head). This one does not, so the "
+            "full projection cannot be avoided; run with loss_mode='builtin' and a "
+            "smaller context instead."
+        )
+
+    outputs = backbone(**inputs, use_cache=False)
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is None:
+        raise DatasetError(
+            "the backbone returned no last_hidden_state, so the supervised positions cannot be "
+            "selected before the vocabulary projection. Use loss_mode='builtin'."
+        )
+
+    # Causal shift: position i predicts token i+1. Identical to the built-in loss.
+    shifted_hidden = hidden[:, :-1, :]
+    shifted_labels = labels[:, 1:]
+    supervised = shifted_labels != IGNORED_INDEX
+    if not bool(supervised.any()):
+        raise DatasetError(
+            "no supervised position in this batch; the loss would be undefined and a zero "
+            "gradient step would be recorded as progress"
+        )
+    logits = head(shifted_hidden[supervised])
+    return functional.cross_entropy(logits.float(), shifted_labels[supervised])
+
+
+def architecture_facts(config: Any) -> dict[str, Any]:
+    """The numbers a memory estimate needs, read off a model config.
+
+    Duck-typed on purpose: this module must not import transformers, so the plan and
+    the arithmetic stay testable with no checkpoint and no GPU. Missing linear
+    attention fields simply mean there is no recurrent state to account for, which
+    is the correct answer for a text-only architecture rather than a guess.
+    """
+    text = getattr(config, "text_config", config)
+    layer_types = list(getattr(text, "layer_types", []) or [])
+    linear_layers = sum(1 for kind in layer_types if kind == "linear_attention")
+    v_heads = int(getattr(text, "linear_num_value_heads", 0) or 0)
+    k_dim = int(getattr(text, "linear_key_head_dim", 0) or 0)
+    v_dim = int(getattr(text, "linear_value_head_dim", 0) or 0)
+    return {
+        "layers": int(getattr(text, "num_hidden_layers", 0)),
+        "hidden": int(getattr(text, "hidden_size", 0)),
+        "vocab": int(getattr(text, "vocab_size", 0)),
+        "linear_layers": linear_layers,
+        "full_layers": max(0, len(layer_types) - linear_layers),
+        # Bytes of recurrent state per token per linear layer. This is the term
+        # that makes a hybrid architecture's memory scale with sequence length:
+        # for Qwen3.5-4B it is 1 MB, so 8K tokens across 24 layers is ~196 GB.
+        "state_bytes_per_token": v_heads * k_dim * v_dim * _ACTIVATION_BYTES,
+    }
+
+
+def estimate_memory(
+    facts: Mapping[str, Any],
+    *,
+    parameters: int,
+    context_length: int,
+    supervised_share: float,
+    gradient_checkpointing: bool,
+    optimiser: str,
+    loss_mode: str = "selective",
+    batch_size: int = 1,
+) -> MemoryBudget:
+    """Estimate a run's peak memory, term by term.
+
+    All inputs are plain numbers so this is testable without a GPU. The estimate is
+    approximate in its two activation terms and exact in its resident ones; the
+    resident terms are the ones that decide whether a card is in the conversation
+    at all, which is why they are separated and named.
+
+    ``supervised_share`` is the fraction of positions carrying a label. The
+    vocabulary term is proportional to it under ``selective`` and to 1.0 under
+    ``builtin`` -- that ratio is the whole reason the mode exists.
+    """
+    parameters_b = parameters / 1e9
+    weights = parameters_b * 2
+    gradients = parameters_b * 2
+    # Adafactor keeps factored row and column statistics, so its state is a few
+    # megabytes rather than a copy of the parameters. AdamW keeps two.
+    optimiser_gb = 0.02 if optimiser == "adafactor" else parameters_b * 8
+
+    tokens = context_length * batch_size
+    hidden = int(facts.get("hidden", 0))
+    layers = int(facts.get("layers", 0))
+    vocab = int(facts.get("vocab", 0))
+    state_bytes = int(facts.get("state_bytes_per_token", 0))
+    linear_layers = int(facts.get("linear_layers", 0))
+
+    if gradient_checkpointing:
+        # Only layer inputs survive between layers; one layer is recomputed at a
+        # time, so the state is paid for a single layer rather than all of them.
+        stored = layers * tokens * hidden * _ACTIVATION_BYTES
+        transient_state = state_bytes * tokens
+    else:
+        stored = layers * tokens * hidden * _ACTIVATION_BYTES
+        transient_state = state_bytes * tokens * linear_layers
+    intermediates = _INTERMEDIATES_PER_LAYER * tokens * hidden * _ACTIVATION_BYTES
+    transient = transient_state + (1.0 if gradient_checkpointing else layers) * intermediates
+
+    projected = supervised_share if loss_mode == "selective" else 1.0
+    loss = projected * tokens * vocab * _ACTIVATION_BYTES * 2  # bf16 logits + fp32 copy
+
+    return MemoryBudget(
+        weights=weights,
+        gradients=gradients,
+        optimiser=optimiser_gb,
+        stored_activations=stored / _GB,
+        transient_activations=transient / _GB,
+        loss=loss / _GB,
+        context_length=context_length,
+        loss_mode=loss_mode,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +357,13 @@ class OptimisationPlan:
     #: two runs with identical hyperparameters and different destinations do not
     #: leave the same evidence behind.
     hub: HubPushPolicy | None = None
+    #: The card this run is fitted against. Checked before the loop, with the
+    #: arithmetic printed either way, so a run that cannot fit says so in a second
+    #: rather than in three hours.
+    memory_budget_gb: float = DEFAULT_MEMORY_BUDGET_GB
+    #: How the loss is computed. See :data:`LOSS_MODES`; the default projects the
+    #: vocabulary only at supervised positions.
+    loss_mode: str = "selective"
 
     def __post_init__(self) -> None:
         """Reject a plan that cannot train, before it costs a GPU hour to find out."""
@@ -138,6 +381,10 @@ class OptimisationPlan:
             raise DatasetError(f"dtype must be one of {DTYPES}, got {self.dtype!r}")
         if self.optimizer not in OPTIMIZERS:
             raise DatasetError(f"optimizer must be one of {OPTIMIZERS}, got {self.optimizer!r}")
+        if self.loss_mode not in LOSS_MODES:
+            raise DatasetError(f"loss_mode must be one of {LOSS_MODES}, got {self.loss_mode!r}")
+        if self.memory_budget_gb <= 0:
+            raise DatasetError(f"memory_budget_gb must be > 0, got {self.memory_budget_gb}")
         if not self.model_id:
             raise DatasetError("model_id is required; a run needs an author")
 
@@ -166,6 +413,8 @@ class OptimisationPlan:
             "dtype": self.dtype,
             "gradient_checkpointing": self.gradient_checkpointing,
             "optimizer": self.optimizer,
+            "memory_budget_gb": self.memory_budget_gb,
+            "loss_mode": self.loss_mode,
             "hub": self.hub.to_record() if self.hub is not None else None,
             "token_format": FORMAT_VERSION,
         }
@@ -222,6 +471,53 @@ class RunSummary:
             "history": self.history,
             "pushes": [p.to_record() for p in self.pushes],
         }
+
+
+def _supervised_share(examples: Sequence[Any]) -> float:
+    """The fraction of positions in the corpus that carry a label.
+
+    Measured rather than assumed, because the vocabulary term in the memory budget
+    is proportional to exactly this number. A corpus of short answers supervises
+    most of itself; an agent trajectory supervises the assistant's turns and little
+    else, and the difference is a factor of three in the largest single term.
+    """
+    total = 0
+    supervised = 0
+    for example in examples:
+        length = getattr(example, "length", 0)
+        if not length:
+            continue
+        total += length
+        supervised += int(getattr(example, "supervised_tokens", 0))
+    if total == 0:
+        return 1.0
+    return min(1.0, supervised / total)
+
+
+def measure_run(
+    model: Any,
+    config: Any,
+    plan: OptimisationPlan,
+    *,
+    supervised_share: float,
+) -> MemoryBudget:
+    """Estimate a loaded run's memory: exact resident terms, stated activation terms.
+
+    The parameter count is read off the loaded model rather than the name, because
+    a name cannot tell you how big a vision tower is. A multimodal checkpoint
+    carries a tower, and forgetting it understates the floor that decides whether a
+    card is in the conversation at all.
+    """
+    parameters = sum(p.numel() for p in model.parameters())
+    return estimate_memory(
+        architecture_facts(config),
+        parameters=parameters,
+        context_length=plan.context_length,
+        supervised_share=supervised_share,
+        gradient_checkpointing=plan.gradient_checkpointing,
+        optimiser=plan.optimizer,
+        loss_mode=plan.loss_mode,
+    )
 
 
 def enter_training_mode(model: Any) -> int:
@@ -502,6 +798,26 @@ def train(
     emit(f"model class: {loader.__name__} (multimodal checkpoint: {is_multimodal(model_config)})")
     model = loader.from_pretrained(weights, dtype=_torch_dtype(plan.dtype, torch))
     switched = enter_training_mode(model)
+
+    budget = measure_run(
+        model,
+        model_config,
+        plan,
+        supervised_share=_supervised_share(examples),
+    )
+    emit(budget.report())
+    emit(f"budget: {budget.total:.2f} GB est. / {plan.memory_budget_gb:.2f} GB kart")
+    if not budget.fits(plan.memory_budget_gb):
+        raise DatasetError(
+            f"this run needs about {budget.total:.1f} GB and the budget is "
+            f"{plan.memory_budget_gb:.1f} GB. The resident floor alone -- weights, gradients "
+            f"and optimiser state -- is {budget.resident:.1f} GB and cannot be traded away. "
+            "Options, in order of what they cost: lower context_length, switch optimizer to "
+            "adafactor if it is not already, keep gradient_checkpointing on, or use "
+            "loss_mode='selective'. Raising memory_budget_gb is honest if the card really has "
+            "the room; the printed breakdown says which term moved."
+        )
+
     if not plan.train_vision_tower:
         model, frozen = freeze_vision_tower(model)
         emit(f"vision tower frozen: {frozen} parameters")
@@ -586,9 +902,12 @@ def train(
             for k, v in tensors.items()
             if k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
         }
-        outputs = model(**inputs, labels=tensors["labels"])
-        (outputs.loss / plan.gradient_accumulation_steps).backward()
-        window_loss += float(outputs.loss.detach())
+        if plan.loss_mode == "selective":
+            loss = completion_only_loss(model, inputs, tensors["labels"])
+        else:
+            loss = model(**inputs, labels=tensors["labels"]).loss
+        (loss / plan.gradient_accumulation_steps).backward()
+        window_loss += float(loss.detach())
         pending += 1
         seen += len(batch)
 

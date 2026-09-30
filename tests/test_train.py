@@ -21,7 +21,9 @@ from gotooltrain.hub import HubPushPolicy
 from gotooltrain.schema import FORMAT_VERSION
 from gotooltrain.train import (
     CONTEXT_LENGTH,
+    DEFAULT_MEMORY_BUDGET_GB,
     DTYPES,
+    LOSS_MODES,
     OptimisationPlan,
     RunSummary,
     _apply_step,
@@ -30,12 +32,16 @@ from gotooltrain.train import (
     _maybe_push,
     _push_checkpoint,
     _record_push,
+    _supervised_share,
     _torch_dtype,
     _vision_pad_id,
+    architecture_facts,
     assert_examples_fit,
     assert_token_format,
+    completion_only_loss,
     cosine_lr,
     enter_training_mode,
+    estimate_memory,
     freeze_vision_tower,
     is_multimodal,
     iter_epochs,
@@ -1070,3 +1076,330 @@ def test_the_vision_tower_is_frozen_only_when_asked(
     lines: list[str] = []
     train(training_plan, examples, device="cpu", log=lines.append)
     assert any("vision tower frozen" in line for line in lines)
+
+
+# -------------------------------------------------------- the memory budget
+#
+# A budget nobody can check is a budget nobody trusts, so the arithmetic is pure
+# and tested against the numbers this model was actually measured at: a 248,320
+# vocabulary and 24 Gated DeltaNet layers whose recurrent state is 1 MB per token.
+
+QWEN3_5_FACTS = {
+    "layers": 32,
+    "hidden": 2560,
+    "vocab": 248_320,
+    "linear_layers": 24,
+    "full_layers": 8,
+    "state_bytes_per_token": 1_048_576,
+}
+FOUR_B_PARAMETERS = 4_330_000_000
+
+
+def budget(**overrides: Any):
+    base: dict[str, Any] = {
+        "facts": QWEN3_5_FACTS,
+        "parameters": FOUR_B_PARAMETERS,
+        "context_length": 4096,
+        "supervised_share": 0.32,
+        "gradient_checkpointing": True,
+        "optimiser": "adafactor",
+    }
+    base.update(overrides)
+    return estimate_memory(**base)
+
+
+def test_the_resident_floor_is_what_a_full_fine_tune_cannot_trade_away() -> None:
+    """Weights and one gradient per parameter, whatever else is done.
+
+    This is the reason the budget has to be stated: for a 4.33B model it is 17.3 GB
+    before a single activation exists, so a 40 GB card has about 22 GB to spend on
+    everything else and the choice of loss decides whether that is enough.
+    """
+    estimated = budget()
+    assert estimated.weights == pytest.approx(8.66, abs=0.01)
+    assert estimated.gradients == pytest.approx(8.66, abs=0.01)
+    assert estimated.resident == pytest.approx(17.34, abs=0.02)
+
+
+def test_adafactor_state_is_negligible_and_adamw_is_not() -> None:
+    """The reason the low-memory optimiser is the default on one card."""
+    assert budget(optimiser="adafactor").optimiser < 0.1
+    assert budget(optimiser="adamw").optimiser == pytest.approx(34.6, abs=0.1)
+
+
+def test_the_vocabulary_term_dominates_and_the_loss_mode_cuts_it() -> None:
+    """248,320 logits per position, and only 32% of positions carry a label.
+
+    The measured supervised share of this project's own corpus, and the reason
+    ``selective`` exists: the same arithmetic on 3.1x less memory.
+    """
+    selective = budget(loss_mode="selective")
+    full = budget(loss_mode="builtin")
+    assert full.loss / selective.loss == pytest.approx(1 / 0.32, rel=0.01)
+    assert full.loss > selective.loss
+
+
+def test_checkpointing_is_the_difference_between_fitting_and_not() -> None:
+    """A recurrent state of 1 MB per token does not care how big the model is.
+
+    Without checkpointing, 8K tokens across 24 linear layers is ~196 GB -- which is
+    the measurement that turned an 80 GB card into an out-of-memory error.
+    """
+    on = budget(gradient_checkpointing=True, context_length=8192)
+    off = budget(gradient_checkpointing=False, context_length=8192)
+    assert off.transient_activations > 100
+    assert on.transient_activations < 20
+    assert on.transient_activations < off.transient_activations / 5
+
+
+def test_every_term_grows_with_the_context_length() -> None:
+    """The context is the only knob that moves all three variable terms at once."""
+    small = budget(context_length=2048)
+    large = budget(context_length=8192)
+    assert large.stored_activations > small.stored_activations
+    assert large.transient_activations > small.transient_activations
+    assert large.loss > small.loss
+
+
+def test_the_estimate_and_the_budget_are_both_serialisable() -> None:
+    record = budget().to_record()
+    assert record["context_length"] == 4096
+    assert record["loss_mode"] == "selective"
+    assert record["total_gb"] == pytest.approx(budget().total, abs=0.01)
+
+
+def test_the_report_names_every_term() -> None:
+    """A reader has to be able to see which knob moves the answer."""
+    report = budget().report()
+    for term in ("weights", "gradients", "optimiser", "activations", "vocabulary loss"):
+        assert term in report
+    assert "total" in report
+
+
+def test_a_forty_gigabyte_card_fits_a_four_b_model_at_four_k() -> None:
+    """The claim this whole exercise exists to make, as arithmetic."""
+    assert budget(context_length=4096).fits(40.0)
+
+
+def test_it_does_not_fit_at_thirty_two_k_and_says_so_which_term() -> None:
+    """A refusal is only useful if it names the term that will not move."""
+    over = budget(context_length=32_768)
+    assert not over.fits(40.0)
+    assert over.transient_activations > over.resident
+
+
+def test_architecture_facts_reads_the_hybrid_architecture() -> None:
+    """24 of 32 layers are linear attention, and that is the memory fact."""
+
+    class Text:
+        hidden_size = 2560
+        num_hidden_layers = 32
+        vocab_size = 248_320
+        layer_types = ["linear_attention"] * 24 + ["full_attention"] * 8
+        linear_num_value_heads = 32
+        linear_key_head_dim = 128
+        linear_value_head_dim = 128
+
+    class Config:
+        text_config = Text()
+
+    facts = architecture_facts(Config())
+    assert facts["linear_layers"] == 24
+    assert facts["full_layers"] == 8
+    assert facts["state_bytes_per_token"] == 32 * 128 * 128 * 2
+
+
+def test_a_text_only_architecture_has_no_recurrent_state_to_count() -> None:
+    """Missing fields mean zero, not a guess: a text-only model really has none."""
+
+    class Config:
+        text_config = type(
+            "Text",
+            (),
+            {"hidden_size": 4096, "num_hidden_layers": 32, "vocab": 32_000},
+        )()
+
+    facts = architecture_facts(Config())
+    assert facts["linear_layers"] == 0
+    assert facts["state_bytes_per_token"] == 0
+
+
+def test_the_plan_refuses_an_impossible_budget() -> None:
+    with pytest.raises(DatasetError, match="memory_budget_gb must be > 0"):
+        plan(memory_budget_gb=0)
+
+
+def test_the_plan_refuses_an_unknown_loss_mode() -> None:
+    with pytest.raises(DatasetError, match="loss_mode must be one of"):
+        plan(loss_mode="magic")
+
+
+def test_selective_is_the_default_loss_because_it_is_cheaper_and_identical() -> None:
+    """Named, not silent: the alternative exists and is a deliberate choice."""
+    assert LOSS_MODES == ("selective", "builtin")
+    assert plan().loss_mode == "selective"
+
+
+def test_the_budget_and_loss_mode_are_recorded() -> None:
+    record = plan(memory_budget_gb=24, loss_mode="builtin").to_record()
+    assert record["memory_budget_gb"] == 24
+    assert record["loss_mode"] == "builtin"
+    assert plan().memory_budget_gb == DEFAULT_MEMORY_BUDGET_GB
+    assert plan().loss_mode == "selective"
+
+
+# ------------------------------------------------------- the supervised share
+
+
+def test_the_supervised_share_is_measured_from_the_examples() -> None:
+    """The vocabulary term is proportional to this number, so it is not guessed."""
+
+    class Ex:
+        def __init__(self, length: int, supervised: int) -> None:
+            self.length = length
+            self.supervised_tokens = supervised
+
+    share = _supervised_share([Ex(100, 25), Ex(300, 75)])
+    assert share == pytest.approx(0.25)
+
+
+def test_a_corpus_with_no_measurable_length_falls_back_to_the_whole_sequence() -> None:
+    """An empty corpus is refused later; the estimate must not divide by zero."""
+    assert _supervised_share([]) == 1.0
+    assert _supervised_share([object()]) == 1.0
+
+
+def test_a_share_above_one_is_clamped() -> None:
+    class Ex:
+        length = 10
+        supervised_tokens = 99
+
+    assert _supervised_share([Ex()]) == 1.0
+
+
+# ---------------------------------------------------------- the selective loss
+
+
+def _load_tiny_model(directory: pathlib.Path) -> Any:
+    """The tiny checkpoint, in the auto-class the fixture actually produces.
+
+    The fixture is built through ``AutoModelForCausalLM``, so the saved config is
+    the text configuration and the multimodal auto-class refuses it. That is fine
+    for this test: the arithmetic under examination is the same for both wrappers,
+    and the guard for a model without a separable head is covered by fakes below.
+    """
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    model = transformers.AutoModelForCausalLM.from_pretrained(str(directory))
+    return model.to(torch.float32)
+
+
+def _tiny_batch() -> tuple[Any, Any, Any]:
+    torch = pytest.importorskip("torch")
+    ids = torch.tensor([[3, 14, 15, 92, 65, 35, 89, 79], [1, 2, 3, 4, 5, 6, 7, 8]])
+    mask = torch.ones_like(ids)
+    labels = ids.clone()
+    # Supervise a scattered subset, exactly as an agent trajectory does.
+    labels[:, 1] = -100
+    labels[:, 4] = -100
+    labels[1, 6:] = -100
+    return ids, mask, labels
+
+
+def test_the_selective_loss_computes_the_same_number_as_the_built_in_one(
+    tiny_checkpoint: pathlib.Path,
+) -> None:
+    """The whole justification is "identical arithmetic, less memory".
+
+    If the numbers differed it would be a different loss wearing the same name,
+    and no amount of memory saved would make that acceptable. This is the test
+    that has to exist for the memory argument to mean anything.
+    """
+    torch = pytest.importorskip("torch")
+    model = _load_tiny_model(tiny_checkpoint)
+    model.train()
+    torch.manual_seed(0)
+    ids, mask, labels = _tiny_batch()
+
+    built_in = model(input_ids=ids, attention_mask=mask, labels=labels).loss
+    selective = completion_only_loss(model, {"input_ids": ids, "attention_mask": mask}, labels)
+
+    assert float(selective) == pytest.approx(float(built_in), rel=1e-5)
+
+
+def test_the_selective_loss_produces_the_same_gradients(
+    tiny_checkpoint: pathlib.Path,
+) -> None:
+    """A loss whose value matches but whose gradient does not is a different loss.
+
+    Tolerated at fp32 rounding rather than bit-exactly: the two forms sum over
+    ``[T, vocab]`` and ``[N, vocab]``, so the reduction order differs and the last
+    bits differ with it. Measured gap on the tiny checkpoint: 4e-06.
+    """
+    torch = pytest.importorskip("torch")
+    model = _load_tiny_model(tiny_checkpoint)
+    model.train()
+    torch.manual_seed(1)
+    ids, mask, labels = _tiny_batch()
+
+    model.zero_grad()
+    model(input_ids=ids, attention_mask=mask, labels=labels).loss.backward()
+    from_builtin = [p.grad.clone() for p in model.parameters() if p.grad is not None]
+
+    model.zero_grad()
+    completion_only_loss(model, {"input_ids": ids, "attention_mask": mask}, labels).backward()
+    from_selective = [p.grad.clone() for p in model.parameters() if p.grad is not None]
+
+    assert len(from_builtin) == len(from_selective) > 0
+    for a, b in zip(from_builtin, from_selective, strict=True):
+        assert torch.allclose(a, b, rtol=1e-4, atol=1e-5), "gradients diverged"
+
+
+def test_a_checkpoint_without_a_separable_head_is_refused() -> None:
+    """The escape hatch has to be explicit.
+
+    Falling back to the full projection would cost exactly the memory this
+    function exists to save, and nothing would report it.
+    """
+
+    class NoHead:
+        model = None
+        lm_head = None
+
+    with pytest.raises(DatasetError, match="separates the backbone"):
+        completion_only_loss(NoHead(), {}, None)
+
+
+def test_a_backbone_that_hides_its_hidden_state_is_refused() -> None:
+
+    torch = pytest.importorskip("torch")
+
+    class Backbone:
+        def __call__(self, **kwargs: Any) -> Any:
+            return object()
+
+    class Opaque:
+        model = Backbone()
+        lm_head = staticmethod(lambda x: x)
+
+    with pytest.raises(DatasetError, match="no last_hidden_state"):
+        completion_only_loss(Opaque(), {}, torch.zeros(1, 4))
+
+
+def test_a_batch_with_nothing_supervised_is_refused() -> None:
+    """A zero gradient step recorded as progress is the worst outcome here."""
+    torch = pytest.importorskip("torch")
+
+    class Backbone:
+        def __call__(self, **kwargs: Any) -> Any:
+            class Output:
+                last_hidden_state = torch.zeros(1, 4, 8)
+
+            return Output()
+
+    class Model:
+        model = Backbone()
+        lm_head = staticmethod(lambda x: x)
+
+    with pytest.raises(DatasetError, match="no supervised position"):
+        completion_only_loss(Model(), {}, torch.full((1, 4), -100))

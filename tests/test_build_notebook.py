@@ -465,15 +465,34 @@ def test_the_failure_excerpt_cannot_be_scrolled_away() -> None:
 def test_the_context_is_chosen_from_a_measured_budget_not_a_round_number() -> None:
     """Qwen3.5-4B's activation memory scales with sequence length, not with a constant.
 
-    24 of its 32 layers are Gated DeltaNet with a 1 MB-per-token recurrent state,
-    so 8K tokens is ~196 GB of stored activations and OOMs an 80 GB card. The
-    notebook therefore runs at 4096, where the measured corpus keeps 42% of its
-    records, and says *why* the number is what it is.
+    24 of its 32 layers are Gated DeltaNet with a 1 MB-per-token recurrent state, so
+    the run is fitted against a stated card: 8192 tokens estimates to 29.3 GB of a
+    40 GB budget, and 16384 is refused. The notebook says which, and says that the
+    activation term is the approximate one.
     """
     parameters = "\n".join(sources(c) for c in build_cells() if c["cell_type"] == "code")
-    assert "CONTEXT_LENGTH = 4096" in parameters
-    assert "1 MB" in parameters, "the budget must be stated, not implied"
-    assert "%42" in parameters or "42%" in parameters, "the surviving share is measured"
+    assert "CONTEXT_LENGTH = 8192" in parameters
+    assert "MEMORY_BUDGET_GB = 40.0" in parameters
+    assert "17,34" in parameters, "the resident floor is stated, because it is exact"
+    assert "HAYIR" in parameters, "at least one context is shown not fitting"
+
+
+def test_the_notebook_states_the_budget_it_is_fitted_against() -> None:
+    """A budget that is not passed to the trainer is a comment, not a constraint."""
+    joined = "\n".join(code_cells())
+    assert '"--memory-budget-gb", str(MEMORY_BUDGET_GB)' in joined
+    assert '"--loss-mode", "selective"' in joined
+
+
+def test_the_reader_is_told_which_term_of_the_estimate_is_fuzzy() -> None:
+    """The activation terms are estimates; the resident ones are not.
+
+    Stating that is the difference between a budget a reader can trust and one they
+    have to take on faith.
+    """
+    parameters = "\n".join(sources(c) for c in build_cells() if c["cell_type"] == "code")
+    assert "tahmindir" in parameters
+    assert "hangi terimin belirsiz" in parameters
 
 
 def test_the_reader_is_told_to_check_that_checkpointing_actually_fired() -> None:

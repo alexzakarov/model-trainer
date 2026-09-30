@@ -55,18 +55,29 @@ def _code(source: str) -> dict[str, Any]:
 _PARAMETERS_BODY = """
 # Eğitim
 #
-# 4096, varsayılan 32768 değil — ölçülmüş bir seçim. Qwen3.5-4B'de 32 katmanın
-# 24'ü Gated DeltaNet (lineer dikkat) ve durum [32 v_heads, 128, 128] yani
-# **token başına 1 MB**. Bu yüzden aktivasyon belleği bağlamla **doğrusal** büyür:
-# 8192 token'da checkpointing olmadan ~196 GB. 80 GB kartta 8192 denendi ve
-# OOM verdi. Aşağıdaki dağılım bu korpusun gerçek uzunlukları (ölçüldü):
+# Bağlam ve bellek bütçesi birlikte seçilir; ikisi de ölçülmüş değerlerdir, devir
+# değil. Qwen3.5-4B'de 32 katmanın 24'ü Gated DeltaNet (lineer dikkat) ve durum
+# [32 v_heads, 128, 128] yani **token başına 1 MB**. Bu yüzden aktivasyon belleği
+# bağlamla doğrusal büyür ve 4B'nin kalıcı tabanı (ağırlık + gradyan + adafactor)
+# **17,34 GB**'dır — ne yaparsan yap geri kalanı daraltamazsın.
 #
-#     < 2048 : %11     < 4096 : %42     < 8192 : %72     medyan 4848
+# Gönderilen tahmin (gerçek config, ölçülmüş %32 denetimli oran):
 #
-# 4096 hem sığdırıyor hem korpusun yarısını bırakıyor. 8192'yi denemek istersen
-# önce DRY_RUN=True ile bak: tek adım sığmıyorsa saatler harcanmış olur.
-CONTEXT_LENGTH = 4096
-EXPANDABLE_SEGMENTS = True               # parçalanmayı azaltır (bkz. aşağıdaki hücre)
+#     bağlam   resident  transient   loss    toplam   40 GB'de
+#      2048      17,34      2,08    0,61     20,34     evet
+#      4096      17,34      4,16    1,21     23,33     evet
+#      8192      17,34      8,31    2,43     29,33     evet
+#     16384      17,34     16,62    4,85     41,32     HAYIR
+#
+# 8192 seçildi: 40 GB bütçesinin içinde ~10 GB pay bırakıyor, korpusun %72'sini
+# kullanıyor. (Aktivasyon terimi *tahmindir*; kalıcı olanlar kesin. 10. hücre
+# bütçeyi basar, hangi terimin belirsiz olduğunu orada görürsün.)
+#
+# 10. hücre `--memory-budget-gb` ile bu tabloyu zorlar: sığmıyorsa **başlamadan**
+# durur. 16384 isteyen 40 GB'lık bir kartta reddedilecek, 80 GB'lıkta geçecek.
+CONTEXT_LENGTH = 8192
+MEMORY_BUDGET_GB = 40.0
+EXPANDABLE_SEGMENTS = True               # parçalanmayı azaltır (bkz. 4. hücre)
 EPOCHS = 1
 BATCH_SIZE = 1
 GRAD_ACCUM = 8
@@ -697,6 +708,8 @@ command = [
     "--grad-accum", str(GRAD_ACCUM),
     "--lr", str(LEARNING_RATE),
     "--max-length", str(CONTEXT_LENGTH),
+    "--memory-budget-gb", str(MEMORY_BUDGET_GB),
+    "--loss-mode", "selective",
     "--optimizer", "adafactor",
     "--gradient-checkpointing",
     "--hub-repo-id", HF_REPO_ID,
