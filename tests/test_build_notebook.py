@@ -322,7 +322,7 @@ def test_the_training_cell_refuses_to_swallow_a_failure() -> None:
     """
     joined = "\n".join(code_cells())
     training = joined.index("gotooltrain.traincli")
-    check = joined.index("if result.returncode != 0:", training)
+    check = joined.index("if result != 0:", training)
     assert training < check
     verify = joined.index("@title 11", training)
     assert check < verify, "the failure is raised before the verification cell runs"
@@ -424,6 +424,42 @@ def test_the_failure_message_really_interpolates() -> None:
     training = joined[joined.index("@title 10") : joined.index("@title 11")]
     assert "{{result.returncode}}" not in training, "an f-string with escaped braces prints braces"
     assert "{" in training and "}" in training, "the message must still interpolate something"
+
+
+def test_a_record_that_reached_the_context_limit_is_dropped() -> None:
+    """Supervised tokens are not evidence the record was not cut.
+
+    Truncation keeps the head. If the assistant turn starts before the limit, the
+    truncated record still has supervised tokens -- so the old test waved it
+    through, and training, which re-renders without a limit, refused it. Measured
+    on the first 400 records of the real corpus: 74 of the 364 kept sat on the
+    8192 cap, with true lengths from 8.5K to 17.6K tokens. The pre-flight was
+    approving exactly the records the trainer would reject.
+    """
+    joined = "\n".join(code_cells())
+    measuring = joined[joined.index("@title 8") : joined.index("@title 9")]
+    guard = "if len(example.input_ids) >= MAX_TOKENS_PER_RECORD:"
+    assert guard in measuring
+    truncate = measuring.index(guard)
+    supervision = measuring.index("if example.supervised_tokens == 0:")
+    assert truncate < supervision, "length is checked first: it is the stronger test"
+    assert "dropped_truncated" in measuring, "the two refusal reasons are counted apart"
+
+
+def test_the_failure_excerpt_cannot_be_scrolled_away() -> None:
+    """The child's own error line was never visible, and we read the wrong cell.
+
+    A multi-hour run's output scrolls; a diagnosis that depends on the reader
+    spotting a line in the scrollback is a diagnosis that depends on luck. The
+    output is therefore teed to a file and the tail is reprinted on failure, which
+    costs nothing while the run is healthy.
+    """
+    joined = "\n".join(code_cells())
+    training = joined[joined.index("@title 10") : joined.index("@title 11")]
+    assert "subprocess.Popen" in training, "streaming, so a long run still shows progress"
+    assert "stderr=subprocess.STDOUT" in training, "stderr must reach the log, not vanish"
+    assert "train.log" in training
+    assert "log_path.read_text" in training, "the excerpt is reprinted, not merely kept"
 
 
 def test_a_dry_run_publishes_nothing() -> None:

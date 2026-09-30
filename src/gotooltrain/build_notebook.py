@@ -552,7 +552,8 @@ print(f"{len(records)} kayıt okundu (sınır: {MAX_RECORDS})")
 kept = []
 first_rendered = None
 dropped_invalid = 0
-dropped_long = 0
+dropped_truncated = 0
+dropped_no_supervision = 0
 total_tokens = 0
 supervised_tokens = 0
 longest = 0
@@ -566,10 +567,19 @@ for record in records:
             print(f"  reddedildi (geçersiz): {type(exc).__name__}: {exc}")
         continue
     example = render_example(tokenizer, conversation, max_length=MAX_TOKENS_PER_RECORD)
+
+    # **Tavana oturan kayıt kesilmiştir.** Kesme baştaki token'ları korur, yani
+    # asistan turn'ü sınırdan önce başladıysa *denetimli token hâlâ vardır* ve
+    # "denetim var mı" sorusu kesilmiş bir kaydı geçirir. Oysa eğitim kaydı
+    # sınırsız yeniden render eder ve `assert_examples_fit` onu bağlam dışı
+    # diye reddeder — yani ön kontrol, eğitimin reddedeceği kaydı onaylıyordu.
+    # (Ölçüldü: ilk 400 kaydın 74'ü bu durumdaydı; gerçek uzunluklar 8.5K–17.6K.)
+    if len(example.input_ids) >= MAX_TOKENS_PER_RECORD:
+        dropped_truncated += 1
+        continue
     if example.supervised_tokens == 0:
-        # Kesilmiş bir asistan turn'ü: denetlenen token kalmadı. Böyle bir kayıt
-        # modele "yarım bırakıp dur" öğretirdi, yani eğitilmemeli.
-        dropped_long += 1
+        # Asistan turn'üne hiç ulaşılamadı: denetlenecek bir şey yok.
+        dropped_no_supervision += 1
         continue
     kept.append({"messages": record["messages"], "tools": TOOLS})
     total_tokens += len(example.input_ids)
@@ -581,13 +591,18 @@ for record in records:
 if not kept:
     raise SystemExit(
         f"{len(records)} kaydın hiçbiri kullanılabilir değil "
-        f"({dropped_long} bağlam dışı, {dropped_invalid} geçersiz). Eğitilecek veri yok; "
-        "bu koşuyu başlatmak boşa GPU yakar."
+        f"({dropped_truncated} kesilmiş, {dropped_no_supervision} denetimsiz, "
+        f"{dropped_invalid} geçersiz). Eğitilecek veri yok; bu koşuyu başlatmak "
+        "boşa GPU yakar."
     )
 
 share = supervised_tokens / max(1, total_tokens)
 print(f"kabul  : {len(kept)}")
-print(f"atılan: {dropped_long} (bağlam dışı), {dropped_invalid} (geçersiz)")
+print(
+    f"atılan: {dropped_truncated} (bağlamda kesilmiş), "
+    f"{dropped_no_supervision} (asistan turn'üne ulaşılamadı), "
+    f"{dropped_invalid} (geçersiz)"
+)
 print(f"token  : {total_tokens} toplam, {supervised_tokens} denetimli ({share:.1%})")
 average = total_tokens // len(kept)
 print(f"uzunluk: ortalama {average}, en uzun {longest} (sınır {MAX_TOKENS_PER_RECORD})")
@@ -664,16 +679,31 @@ print()
 print("Bu hücre saatlerce sürebilir. Yayınlar PUSH_EVERY adımda birer olur,")
 print("böylece sekme kapanırsa kaybedilen şey en fazla PUSH_EVERY adım olur.")
 print()
-result = subprocess.run(command, check=False)
-print("exit:", result.returncode)
+result = None
+log_path = pathlib.Path("train.log")
+with log_path.open("w", encoding="utf-8", buffering=1) as log:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    for line in process.stdout:
+        print(line, end="")
+        log.write(line)
+    result = process.wait()
 
-# Çıkış kodu **kontrol edilir**. Yoksa başarısız bir koşu sessizce geçer ve hata
-# iki hücre sonra, tamamen alakasız bir yerde ("hub_push.json yok") belirir —
-# yani asıl sebebi değil, sonucunu gördüğümüzü sandığımız hatayı okuruz.
-if result.returncode != 0:
+print("exit:", result)
+
+# Hata, hücre çıktısında **kaybolmasın diye** ayrıca dosyadan basılıyor. Önceki
+# koşuda alt sürecin "error: ..." satırı hiç görünmedi; iki hücre sonra "hub_push.json
+# yok" diye yanlış yere baktık. Uzun bir koşunun çıktısı kaydırılınca kaybolabilir,
+# yani teşhisin tesadüfe bağlı olmaması gerekiyor.
+if result != 0:
     out = pathlib.Path(OUTPUT)
     if not out.is_dir():
-        cause = "Çıktı dizini hiç oluşmadı: koşu modeli yükleyemeden ya da veriyi okuyamadan durdu."
+        cause = "Çıktı dizini hiç oluşmadı: koşu modeli yüklenmeden ya da veriyi okuyamadan durdu."
     else:
         listing = sorted(p.name for p in out.iterdir())
         print(f"\\n{OUTPUT} içinde: {listing}")
@@ -683,8 +713,12 @@ if result.returncode != 0:
             cause = "Plan yazıldı ama bitmedi; yayınlama adımına hiç gelinmedi."
         else:
             cause = "Yayınladı ama hata ile bitti."
+    tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
+    print("\\n--- train.log (son 40 satır) ---")
+    for line in tail:
+        print(" ", line)
     raise SystemExit(
-        f"Eğitim {result.returncode} ile bitti. Yukarıdaki çıktıya bakın. {cause} "
+        f"Eğitim {result} ile bitti. Yukarıdaki çıktıya bakın. {cause} "
         "Bu hücre hatayı yutmaz: 11. hücreye geçmeden durur."
     )
 """
