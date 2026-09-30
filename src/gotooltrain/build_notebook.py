@@ -513,51 +513,84 @@ print(open("data/go-dapt-report.json", encoding="utf-8").read()[:1200])
         ),
         _code(
             """
-# @title 8 — SFT verisini token'la
+# @title 8 — SFT verisini ölç, süz, doğrula
 #
 # Buradaki veri Go-UT-Bench'in *birim testi yaz* görevleridir; değerlendirme
 # trajektöri değil. Bu, yetenek ölçümü değil — format ve boru hattı denemesidir.
-# Tek turlu, tek depodan bir korpus katalogu öğretmez; `measure` bunu "yetersiz"
-# diye bildirecek ve bu doğru cevaptır. Değerlendirme için gerçek bir Go deposu ve
-# konteyner havuzu gerekir (docs/EVAL.md).
+# Tek turlu, araçsız, sekiz depodan biri ağırlıklı bir korpus katalogu öğretmez;
+# `measure` bunu "yetersiz" diye bildirecek ve bu doğru cevaptır. Değerlendirme
+# için konteyner havuzu, rtk ve gerçek Go depoları gerekir (docs/EVAL.md).
+#
+# **Burada token id yazmıyoruz.** Eğitim CLI'si mesajları kendisi render eder;
+# tek render yolu ilkesi budur. Buradaki iş render etmek değil **ölçmek**:
+# hangi kayıtların bağlama sığdığını ve maskenin doğru olduğunu, pahalı
+# hücrelerden önce görmek.
+#
+# Uzunluk **katalogla** ölçülüyor, çünkü eğitim CLI'sı da katalogla render edecek.
+# Katalogsuz ölçseydik altımızda kalırdı ve bağlam dışı bir kayıt eğitimi düşürürdü.
 
 import json
 
 from transformers import AutoTokenizer
 
-from gotooltrain import install_template, load_template_source, normalize_conversation, read_jsonl
+from gotooltrain import (
+    catalog,
+    install_template,
+    load_template_source,
+    normalize_conversation,
+    read_jsonl,
+    render_example,
+)
 
+TOOLS = catalog()
 tokenizer = install_template(AutoTokenizer.from_pretrained(MODEL_ID), load_template_source())
 print("tokenizer hazır:", type(tokenizer).__name__)
 
 records = list(read_jsonl("data/go-unit-tests.jsonl"))[:MAX_RECORDS]
 print(f"{len(records)} kayıt okundu (sınır: {MAX_RECORDS})")
 
-rendered = []
-dropped_long = 0
+kept = []
+first_rendered = None
 dropped_invalid = 0
+dropped_long = 0
+total_tokens = 0
+supervised_tokens = 0
+longest = 0
+
 for record in records:
     try:
-        conversation = normalize_conversation(record["messages"], None)
-    except Exception as exc:  # noqa: BLE001 - her ret sayılmalı, adlandırılmalı
+        conversation = normalize_conversation(record["messages"], TOOLS)
+    except Exception as exc:  # noqa: BLE001 - her ret sayılır, ilk birkaçı adlandırılır
         dropped_invalid += 1
-        print(f"  reddedildi (geçersiz): {type(exc).__name__}: {exc}")
+        if dropped_invalid <= 3:
+            print(f"  reddedildi (geçersiz): {type(exc).__name__}: {exc}")
         continue
-    from gotooltrain import render_example
-
     example = render_example(tokenizer, conversation, max_length=MAX_TOKENS_PER_RECORD)
     if example.supervised_tokens == 0:
+        # Kesilmiş bir asistan turn'ü: denetlenen token kalmadı. Böyle bir kayıt
+        # modele "yarım bırakıp dur" öğretirdi, yani eğitilmemeli.
         dropped_long += 1
         continue
-    rendered.append(example.to_dict())
+    kept.append({"messages": record["messages"], "tools": TOOLS})
+    total_tokens += len(example.input_ids)
+    supervised_tokens += example.supervised_tokens
+    longest = max(longest, len(example.input_ids))
+    if first_rendered is None:
+        first_rendered = example
 
-total_tokens = sum(len(r["input_ids"]) for r in rendered)
-supervised = sum(1 for r in rendered for label in r["labels"] if label != -100)
-share = supervised / max(1, total_tokens)
-print(f"kabul  : {len(rendered)}")
+if not kept:
+    raise SystemExit(
+        f"{len(records)} kaydın hiçbiri kullanılabilir değil "
+        f"({dropped_long} bağlam dışı, {dropped_invalid} geçersiz). Eğitilecek veri yok; "
+        "bu koşuyu başlatmak boşa GPU yakar."
+    )
+
+share = supervised_tokens / max(1, total_tokens)
+print(f"kabul  : {len(kept)}")
 print(f"atılan: {dropped_long} (bağlam dışı), {dropped_invalid} (geçersiz)")
-print(f"token  : {total_tokens} toplam, {supervised} denetimli ({share:.1%})")
-print(f"ortalama: {total_tokens // max(1, len(rendered))} token/kayıt")
+print(f"token  : {total_tokens} toplam, {supervised_tokens} denetimli ({share:.1%})")
+average = total_tokens // len(kept)
+print(f"uzunluk: ortalama {average}, en uzun {longest} (sınır {MAX_TOKENS_PER_RECORD})")
 """
         ),
         _code(
@@ -568,17 +601,12 @@ print(f"ortalama: {total_tokens // max(1, len(rendered))} token/kayıt")
 # kontrol dakikalar sürer, bir 4B epoch saatler sürer. Sıra burada.
 
 from gotooltrain import assert_mask_sane
-from gotooltrain.template import RenderedExample, load_template_source
 from gotooltrain.evalstore import sha256_text
+from gotooltrain.template import load_template_source
 
-first = rendered[0]
-example = RenderedExample(
-    input_ids=first["input_ids"],
-    attention_mask=first["attention_mask"],
-    labels=first["labels"],
-    assistant_mask=first["assistant_mask"],
-    text="",
-)
+# 8. hücrede ölçülen kayıt; eğitimin de göreceği kayıt. Render burada tekrar
+# yapılmıyor: 8. hücre zaten `first_rendered`'ı bıraktı.
+example = first_rendered
 assert_mask_sane(example)
 
 print("maske tutarlı: labels ve assistant_mask aynı yeri işaretliyor")
@@ -607,9 +635,9 @@ import subprocess
 OUTPUT = "runs/colab-sft"
 
 with open("data/sft.jsonl", "w", encoding="utf-8", newline="\\n") as handle:
-    for row in rendered:
-        handle.write(json.dumps({"format_version": "anthropic-tools-v1", **row}) + "\\n")
-print(f"data/sft.jsonl yazıldı: {len(rendered)} kayıt")
+    for row in kept:
+        handle.write(json.dumps(row) + "\\n")
+print(f"data/sft.jsonl yazıldı: {len(kept)} kayıt (mesaj biçimi)")
 
 command = [
     sys.executable, "-m", "gotooltrain.traincli", "sft",
@@ -644,20 +672,19 @@ print("exit:", result.returncode)
 # yani asıl sebebi değil, sonucunu gördüğümüzü sandığımız hatayı okuruz.
 if result.returncode != 0:
     out = pathlib.Path(OUTPUT)
-    listing = sorted(p.name for p in out.iterdir()) if out.is_dir() else []
-    started = "training_plan.json" in listing
-    published = "hub_push.json" in listing
-    print(f"\\n{OUTPUT} içinde: {listing}")
-    if not listing:
-        cause = "Koşu modeli yükleyemeden durdu; çıktı dizini bile oluşmadı."
-    elif not started:
-        cause = "Koşu başlamadan durdu."
-    elif not published:
-        cause = "Koşu başladı ama bitmedi; yayınlama adımına hiç gelinmedi."
+    if not out.is_dir():
+        cause = "Çıktı dizini hiç oluşmadı: koşu modeli yükleyemeden ya da veriyi okuyamadan durdu."
     else:
-        cause = "Koşu yayınladı ama hata ile bitti."
+        listing = sorted(p.name for p in out.iterdir())
+        print(f"\\n{OUTPUT} içinde: {listing}")
+        if "training_plan.json" not in listing:
+            cause = "Plan yazılmadı: koşu başlamadan durdu."
+        elif "hub_push.json" not in listing:
+            cause = "Plan yazıldı ama bitmedi; yayınlama adımına hiç gelinmedi."
+        else:
+            cause = "Yayınladı ama hata ile bitti."
     raise SystemExit(
-        f"Eğitim {{result.returncode}} ile bitti. Yukarıdaki çıktıya bakın.\\n{{cause}}\\n"
+        f"Eğitim {result.returncode} ile bitti. Yukarıdaki çıktıya bakın. {cause} "
         "Bu hücre hatayı yutmaz: 11. hücreye geçmeden durur."
     )
 """

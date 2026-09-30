@@ -134,7 +134,7 @@ def test_the_cells_run_in_a_usable_order() -> None:
         " 5 — Token: Colab secret ya da mock",
         " 6 — Kalite kapısı (paket kendi testini koşar)",
         " 7 — Go korpusunu indir, süz, ölç",
-        " 8 — SFT verisini token'la",
+        " 8 — SFT verisini ölç, süz, doğrula",
         " 9 — Token formatını doğrula (eğitimden ÖNCE)",
         " 10 — Eğitimi başlat (periyodik Hub yüklemesiyle)",
         " 11 — Ne olduğunu doğrula",
@@ -339,7 +339,7 @@ def test_the_training_cell_names_which_stage_the_run_reached() -> None:
     training = joined[joined.index("@title 10") : joined.index("@title 11")]
     assert "training_plan.json" in training, "started-but-unfinished is a different failure"
     assert "hub_push.json" in training, "finished-but-unpublished is a different failure"
-    assert "çıktı dizini bile oluşmadı" in training
+    assert "Çıktı dizini hiç oluşmadı" in training, "and so is 'never got as far as the plan'"
 
 
 def test_the_verification_cell_checks_before_it_reads() -> None:
@@ -366,6 +366,64 @@ def test_the_notebook_tells_the_reader_to_rehearse_before_it_costs_money() -> No
     """
     joined = "\n".join(code_cells())
     assert "DRY_RUN=True ile başla" in joined
+
+
+def test_the_dataset_is_written_in_the_shape_the_training_cli_reads() -> None:
+    """Messages, not token ids.
+
+    The measured failure this prevents: cell 8 rendered examples and handed the
+    token ids on, but the training CLI's loader expects messages and renders them
+    itself. The run died with ``record 0 is not usable: conversation has no
+    messages`` and an output directory that was never created, so the real cause
+    and the reported symptom were two different files apart. There is exactly one
+    render path in this project, and the notebook now goes through it.
+    """
+    joined = "\n".join(code_cells())
+    # The record is built in cell 8 and written in cell 10; both halves matter,
+    # because a wrong shape in either place is equally fatal.
+    building = joined[joined.index("@title 8") : joined.index("@title 9")]
+    writing = joined[joined.index("@title 10") : joined.index("@title 11")]
+    assert 'kept.append({"messages": record["messages"], "tools": TOOLS})' in building
+    assert "example.to_dict()" not in building, (
+        "to_dict() is the token-id shape the CLI cannot read; measuring must not keep it"
+    )
+    assert "input_ids" not in writing, "the notebook must not hand token ids to the CLI"
+    assert "json.dumps(row)" in writing, "the record is written exactly as it was built"
+    assert "mesaj biçimi" in writing
+
+
+def test_the_measurement_matches_what_training_will_render() -> None:
+    """Lengths are measured with the catalogue, because training will render with it.
+
+    Measuring without the catalogue under-counts every record by the size of the
+    tool definitions, so a record the pre-flight accepted is the one training then
+    refuses as over-length -- and the pre-flight was the thing that approved it.
+    """
+    joined = "\n".join(code_cells())
+    measuring = joined[joined.index("@title 8") : joined.index("@title 9")]
+    assert "TOOLS = catalog()" in measuring
+    assert 'normalize_conversation(record["messages"], TOOLS)' in measuring
+
+
+def test_an_emptied_corpus_stops_the_run_before_the_gpu_is_billed() -> None:
+    """Zero usable records is a result, not a reason to start a metered run."""
+    joined = "\n".join(code_cells())
+    measuring = joined[joined.index("@title 8") : joined.index("@title 9")]
+    assert "if not kept:" in measuring
+    assert "Eğitilecek veri yok" in measuring
+
+
+def test_the_failure_message_really_interpolates() -> None:
+    """The escaped-brace slip: the cell printed ``{result.returncode}`` literally.
+
+    A diagnostic that cannot say what happened is worse than no diagnostic, because
+    it looks like one. Asserted by running the cell's own formatter rather than by
+    reading it.
+    """
+    joined = "\n".join(code_cells())
+    training = joined[joined.index("@title 10") : joined.index("@title 11")]
+    assert "{{result.returncode}}" not in training, "an f-string with escaped braces prints braces"
+    assert "{" in training and "}" in training, "the message must still interpolate something"
 
 
 def test_a_dry_run_publishes_nothing() -> None:
