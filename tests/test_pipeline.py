@@ -12,6 +12,7 @@ script.
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import subprocess
 import sys
@@ -306,7 +307,141 @@ def test_a_dry_run_prints_the_plan_and_runs_nothing(tmp_path: pathlib.Path, caps
     out = capsys.readouterr().out
     assert "stages, in order" in out
     assert "quality-gate" in out
-    assert "--dry-run" in out or "[kuru]" in out
+    assert "[dry]" in out, f"the stages were not marked as rehearsals: {out}"
+
+
+def test_a_failed_stage_is_recorded_where_a_caller_can_name_it(tmp_path: pathlib.Path) -> None:
+    """The reader should not have to scroll back through thousands of lines.
+
+    The notebook's single cell runs the pipeline as a subprocess and reads this file
+    to say which stage stopped, so the name survives the scrollback that the log
+    itself does not.
+    """
+    pipeline = Pipeline(
+        [Stage("boom", (sys.executable, "-c", "import sys; sys.exit(4)"))],
+        emit=lambda message: None,
+        log_root=tmp_path,
+    )
+    pipeline.run()
+    record = json.loads((tmp_path / "last_failure.json").read_text(encoding="utf-8"))
+    assert record == {"stage": "boom", "exit_code": 4}
+
+
+def test_auto_continues_from_what_is_already_published() -> None:
+    """Asking the Hub what is there turns a data-loss default into a safe one.
+
+    Every push replaces the repository, so starting from the base model when a
+    trained checkpoint exists destroys it at the first push.
+    """
+    assert pipe.resolve_resume(
+        ["--resume-from", "auto", "--loss-mode", "selective"],
+        repo_id="a/b",
+        fetch=lambda _: {"model.safetensors", "config.json"},
+    ) == ["--resume-from", "a/b", "--loss-mode", "selective"]
+
+
+def test_auto_starts_from_the_base_model_when_nothing_is_published() -> None:
+    """An empty repository is a first run, not a failure."""
+    assert pipe.resolve_resume(
+        ["--resume-from", "auto"], repo_id="a/b", fetch=lambda _: {"README.md"}
+    ) == ["--resume-from", ""]
+
+
+def test_a_query_that_fails_is_not_reported_as_an_empty_repository() -> None:
+    """A failed query is not an empty repository.
+
+    Both look identical from the outside and only one of them is true. Downgrading a
+    failed query to a fresh run would start from the base model and overwrite whatever
+    is published -- the exact loss the check exists to prevent. So it refuses, and says
+    which way to go if the refusal is wrong.
+    """
+
+    def broken(_: str) -> set[str]:
+        raise RuntimeError("401 unauthorized")
+
+    with pytest.raises(DatasetError, match="unknown"):
+        pipe.resolve_resume(["--resume-from", "auto"], repo_id="a/b", fetch=broken)
+
+
+def test_a_concrete_resume_is_never_second_guessed() -> None:
+    """An explicit repository id or revision is a decision, not a question."""
+
+    def broken(_: str) -> set[str]:
+        raise AssertionError("the Hub must not be consulted for a concrete value")
+
+    assert pipe.resolve_resume(["--resume-from", "other/repo:v2"], repo_id="a/b", fetch=broken) == [
+        "--resume-from",
+        "other/repo:v2",
+    ]
+    # And an explicit empty string means "start over on purpose".
+    assert pipe.resolve_resume(["--resume-from", ""], repo_id="a/b", fetch=broken) == [
+        "--resume-from",
+        "",
+    ]
+
+
+def test_a_resume_switch_with_no_value_says_what_was_expected() -> None:
+    with pytest.raises(DatasetError, match="without a value"):
+        pipe.resolve_resume(["--resume-from"], repo_id="a/b")
+
+
+def test_nothing_to_pass_through_is_returned_unchanged() -> None:
+    assert pipe.resolve_resume(["--loss-mode", "selective"], repo_id="a/b") == [
+        "--loss-mode",
+        "selective",
+    ]
+
+
+def test_a_failure_record_that_cannot_be_written_is_reported_not_swallowed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure is already on screen; a second failure must not replace it.
+
+    Writing the record is a convenience for the caller, so if the disk refuses, the
+    run's own error has to stay the thing that is reported.
+    """
+    lines: list[str] = []
+    pipeline = Pipeline(
+        [Stage("boom", (sys.executable, "-c", "import sys; sys.exit(2)"))],
+        emit=lines.append,
+        log_root=tmp_path,
+    )
+    # Only the failure record is unwritable; the stage's own log uses `open` and must
+    # still be written, or this test would prove nothing about the record.
+    monkeypatch.setattr(
+        pathlib.Path,
+        "write_text",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("read-only")),
+        raising=False,
+    )
+    pipeline.run()
+    assert any("could not record" in line for line in lines)
+    assert (tmp_path / "boom.log").is_file(), "the stage's own log still has to exist"
+
+
+def test_the_default_listing_asks_the_hub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The seam is optional: with no ``fetch`` the real Hub is consulted.
+
+    Covered separately because every other test passes one, and a default that quietly
+    did nothing would leave ``--resume-from auto`` silently starting from the base
+    model -- the exact loss this function exists to prevent.
+    """
+    hub = pytest.importorskip("huggingface_hub")
+    asked: list[str] = []
+
+    class Stub:
+        def list_repo_files(self, repo_id: str) -> list[str]:
+            asked.append(repo_id)
+            return ["model.safetensors"]
+
+    monkeypatch.setattr(hub, "HfApi", Stub)
+    assert pipe.resolve_resume(["--resume-from", "auto"], repo_id="a/b") == [
+        "--resume-from",
+        "a/b",
+    ]
+    assert asked == ["a/b"], "the Hub was not asked, so nothing was resolved"
 
 
 def test_selecting_nothing_is_reported_rather_than_silently_succeeding(

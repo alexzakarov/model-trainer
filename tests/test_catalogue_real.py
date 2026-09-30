@@ -142,9 +142,21 @@ def test_go_test_reports_a_real_failure(module: pathlib.Path) -> None:
 @needs_rtk
 @needs_go
 def test_go_build_is_silent_on_success(module: pathlib.Path) -> None:
+    """A successful build says nothing about the code.
+
+    rtk's own "No hook installed" notice is filtered out rather than tolerated
+    everywhere: it is a one-time setup banner, not build output, and it appears on a
+    machine where rtk was installed but never initialised. Leaving it in would mean
+    this test measures how recently someone ran `rtk init -g` instead of whether the
+    build was quiet. The notebook and the sandbox image both run it; this is the
+    assertion for a host that has not.
+    """
     result = call("go_build", module, pkg="./...")
     assert result.status is Status.OK
-    assert result.stdout.strip() == ""
+    noisy = [
+        line for line in result.stdout.splitlines() if line.strip() and not line.startswith("[rtk]")
+    ]
+    assert noisy == [], f"a successful build printed {noisy}"
 
 
 @needs_rtk

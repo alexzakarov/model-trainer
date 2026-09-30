@@ -26,15 +26,24 @@ cannot poison anything.
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
+from . import build_notebook
 from .errors import DatasetError
+
+#: The repository a run publishes to, and the one ``--resume-from auto`` asks about.
+#: Imported rather than repeated: a second copy would be a second place where the
+#: answer to "where did this checkpoint go" lives, and a rename would leave the two
+#: silently disagreeing -- the run trains, the checkpoint uploads, and it lands
+#: somewhere nobody is looking.
+DEFAULT_HUB_REPO: Final[str] = build_notebook.DEFAULT_HF_REPO_ID
 
 #: Where per-stage logs land. Under ``runs/`` so it is ignored like the rest.
 LOG_ROOT = pathlib.Path("runs") / "pipeline"
@@ -93,7 +102,7 @@ class Pipeline:
         self.log_root.mkdir(parents=True, exist_ok=True)
         for stage in self.stages:
             if dry_run:
-                self.emit(f"[kuru] {stage.name}: {' '.join(stage.command)}")
+                self.emit(f"[dry] {stage.name}: {' '.join(stage.command)}")
                 continue
             code = self._one(stage)
             if code != 0 and stage.fatal:
@@ -101,8 +110,22 @@ class Pipeline:
                     f"\nPIPELINE STOPPED at {stage.name} ({code}). "
                     "Its log and last lines are above."
                 )
+                # Written so a caller can say which stage failed without scrolling
+                # back through output that may be thousands of lines long.
+                self._record_failure(stage, code)
                 return code
         return 0
+
+    def _record_failure(self, stage: Stage, code: int) -> None:
+        """Name the failed stage where a caller can read it."""
+        try:
+            (self.log_root / "last_failure.json").write_text(
+                json.dumps({"stage": stage.name, "exit_code": code}, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            # The failure is already on screen; failing to also write it to disk must
+            # not replace one clear error with a second confusing one.
+            self.emit("(could not record which stage failed to disk)")
 
     def _one(self, stage: Stage) -> int:
         """Run one stage, streaming its output and keeping it."""
@@ -154,6 +177,70 @@ class Pipeline:
             mark = "ok" if result.ok else f"{result.returncode}"
             lines.append(f"  {mark:>4}  {result.seconds:8.1f}s  {result.name}  -> {result.log}")
         return "\n".join(lines)
+
+
+def resolve_resume(
+    extra: Sequence[str],
+    *,
+    repo_id: str,
+    fetch: Callable[[str], Iterable[str]] | None = None,
+) -> list[str]:
+    """Turn ``--resume-from auto`` into a decision, before the first stage runs.
+
+    ``auto`` means "continue from whatever this project already published, if anything".
+    The alternative default -- start from the base model -- destroys a trained
+    checkpoint at the first push, because every push replaces the repository. Asking
+    the Hub what is there costs one API call and makes the safe choice the default.
+
+    "Bilmiyorum" is not "yok". A query that fails, a token that is missing and a
+    network that is down all all mean the repository's contents are unknown, and the
+    three of them look identical from the outside. Only one of them means there is
+    nothing to resume from, so a failed query is refused rather than quietly
+    downgraded to a fresh run that would overwrite whatever is there.
+
+    Pass-through when the value is already concrete: an explicit repository id, a
+    revision, or an explicit empty string meaning "start over on purpose".
+
+    ``fetch`` is the seam the tests use. The default asks the Hub, so no caller has to
+    know it exists.
+    """
+    values = list(extra)
+    try:
+        index = values.index("--resume-from")
+    except ValueError:
+        return values
+    if index + 1 >= len(values):
+        raise DatasetError(
+            "--resume-from was given without a value. Pass a repository id to continue "
+            "from one, 'auto' to continue from whatever is already published, or an "
+            "empty string to start over on purpose."
+        )
+
+    if values[index + 1] != "auto":
+        return values
+
+    try:
+        files = set((fetch or _hub_listing)(repo_id))
+    except Exception as exc:  # every failure means "unknown", not "empty"
+        raise DatasetError(
+            f"--resume-from auto could not read {repo_id} ({type(exc).__name__}). "
+            "Whether a checkpoint is published there is unknown, and starting from the "
+            "base model would overwrite it at the first push. Set --resume-from "
+            f'{repo_id} to continue from it deliberately, or --resume-from "" to '
+            "start over on purpose."
+        ) from exc
+
+    weights = {"model.safetensors", "model.safetensors.index.json", "pytorch_model.bin"}
+    values[index + 1] = repo_id if weights & files else ""
+    return values
+
+
+def _hub_listing(repo_id: str) -> Iterable[str]:
+    """What the Hub says a repository contains."""
+    from huggingface_hub import HfApi
+
+    files: Iterable[str] = HfApi().list_repo_files(repo_id)
+    return files
 
 
 def tail(path: pathlib.Path, lines: int) -> list[str]:
@@ -479,6 +566,9 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--max-records", type=int, default=400)
     parser.add_argument("--n-samples", type=int, default=4)
+    parser.add_argument(
+        "--hub-repo", default=DEFAULT_HUB_REPO, help="the repository auto-resume consults"
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the plan and stop")
 
 
@@ -514,6 +604,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     options = argparse.Namespace(**values)
 
+    # `auto` is resolved here, in code that is tested, rather than in the
+    # notebook cell that used to hold it. Every caller gets the same decision.
+    options.extra_sft = resolve_resume(options.extra_sft, repo_id=options.hub_repo)
+    options.extra_dpo = resolve_resume(options.extra_dpo, repo_id=options.hub_repo)
     stages = build_stages(options)
     if not stages:
         print("no stages selected; nothing to do")

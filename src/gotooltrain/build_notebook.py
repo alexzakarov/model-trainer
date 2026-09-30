@@ -305,6 +305,20 @@ shutil.rmtree(rtk_dir, ignore_errors=True)
 os.environ["PATH"] = f"{{root / 'bin'}}:/usr/local/bin:{{os.environ['PATH']}}"
 os.environ["GOTOOLCHAIN"] = "local"
 
+# ---------------------------------------------------------------- rtk kurulumu
+#
+# rtk kurulu ama başlatılmamışsa her komuta "[rtk] /!\\ No hook installed" uyarısı
+# basar. Bu, **paketin kendi testlerinden birini kırar**: başarılı bir `go build`
+# sessiz olmalı ve uyarı yazıyor. Yani kurulum eksik değil eksiksiz sayılıyordu ve
+# kalite kapısı Colab'da da düşüyordu — hata modelden değil, iki satır eksik
+# kurulumdan geliyordu. Sandbox imajı bunu yapıyor, o yüzden orada görünmüyor.
+_initialised = subprocess.run(
+    ["rtk", "init", "-g"], capture_output=True, text=True, check=False
+)
+print("rtk init -g:", _initialised.returncode)
+if _initialised.stdout.strip():
+    print(" ", _initialised.stdout.strip()[:400])
+
 # Parçalanma ayarı. CUDA önbelleğinde ayrılmış ama kullanılmayan bloklar uzun
 # bir koşuda birikir ve "boş" görünen belleği yer. Bu ayar ayrılmış blokları
 # büyüterek birleştirir; etkisi çalışma zamanında görülür, tahmin edilemez.
@@ -532,6 +546,8 @@ print(f"40 GB koşusunun yetenekleri: tamam (bütçe {DEFAULT_MEMORY_BUDGET_GB:.
 # Calisma suresi: kalite kapisi + korpus + SFT saatler; degerlendirme ve DPO bunlarin
 # ustune eklenir. Yayinlar PUSH_EVERY adimda birer olur.
 
+import json
+import pathlib
 import subprocess
 import sys
 
@@ -559,15 +575,21 @@ if not RUN_PREFERENCE_STAGE:
 if not RUN_QUALITY_GATE:
     command.append("--no-gate")
 
+# Tek bir `--extra-sft`. argparse REMAINDER, ilk göründüğü yerden sonrasını alır:
+# iki kez geçince ikincisi ilkincinin içine düşer ve eğitim komutu `--extra-sft`
+# diye bilinmeyen bir bayrak görür. Buradaki bütün sıfırda biten bayraklar tek listeye
+# toplanıyor.
+passthrough = []
 if RESUME_FROM:
-    command += ["--extra-sft", "--resume-from", RESUME_FROM]
+    passthrough += ["--resume-from", RESUME_FROM]
 
 if DRY_RUN:
     command.append("--dry-run")
 else:
-    # Kuru kosuda hicbir sey yuklenmez, bu yuzden yayin bayraklari da gonderilmez:
-    # dry-run komutu zaten hicbir sey gondermez, ama bayragi da hicbir seye yaramaz.
-    command += ["--extra-sft", "--hub-repo-id", HF_REPO_ID, "--hub-push-every", str(PUSH_EVERY)]
+    # Kuru koşuda hiçbir şey yüklenmez, bu yüzden yayın bayraklari da gonderilmez.
+    passthrough += ["--hub-repo-id", HF_REPO_ID, "--hub-push-every", str(PUSH_EVERY)]
+if passthrough:
+    command += ["--extra-sft", *passthrough]
 
 print(" ".join(command))
 print()
@@ -576,10 +598,25 @@ result = subprocess.run(command, check=False)
 print()
 print("Boru hatti bitti. Ozet ve loglar: runs/pipeline/")
 if result.returncode:
+    # Boru hatti hangi asamada dustugunu `runs/pipeline/last_failure.json`'a yazar.
+    # Burada tekrar okunuyor: cikti binlerce satir olabilir ve okuyan kisi o asamayi
+    # bulmak icin geri kaydirmak zorunda kalmamali. Kayit yoksa dosya sistemi
+    # sorunu demektir; bu yuzden ayri bir mesajla soyleniyor.
+    failure = pathlib.Path("runs/pipeline/last_failure.json")
+    if failure.is_file():
+        info = json.loads(failure.read_text(encoding="utf-8"))
+        stage = info["stage"]
+        log = pathlib.Path("runs/pipeline") / f"{stage}.log"
+        print(f"\\nDURAN ASAMA: {stage} (cikis kodu {info['exit_code']})")
+        print(f"log: {log}")
+        print("\\n--- son 25 satir ---")
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines()[-25:]:
+            print("  ", line)
+    else:
+        print(f"\\nDURAN ASAMA: bilinmiyor; {failure} yazilmadi.")
     raise SystemExit(
-        f"Boru hatti {result.returncode} ile durdu. Yukarida hangi asamanin ve neden "
-        "durdugu yaziyor; o asamanin logu runs/pipeline/ altinda. Bu hucre hatayi "
-        "yutmaz."
+        f"Boru hatti {result.returncode} ile durdu. Bu hucre hatayi yutmaz; "
+        "asama kendi loguna yaziliyor ve hicbir sey gonderilmedi."
     )
 """
         ),
