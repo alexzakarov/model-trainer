@@ -379,6 +379,42 @@ def measure_dataset(
     }
 
 
+def _install_dependencies(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
+    """Install what the evaluation and the training mode need, before they need it.
+
+    Placed after the training stage on purpose. ``pip install vllm`` can move torch,
+    and a run that rearranges the environment underneath a training job fails in a way
+    that has two possible causes. By the time this runs, the checkpoint exists and has
+    been published, so a broken environment costs the preference chain and not the run.
+
+    Only what is missing is installed, so a host that already has these pays nothing.
+    Everything is named in the log: a run that installs packages silently is a run whose
+    success cannot be reproduced.
+    """
+    wanted: list[str] = []
+    module = _served_module(options.serve_command) if options.serve else None
+    if module and _module_missing(module):
+        # The distribution name is not always the import name; vllm happens to be both,
+        # and a wrong guess here fails as "no matching distribution" rather than as
+        # something a reader can act on.
+        wanted.append(module.split(".")[0])
+    if options.training_mode == "qlora":
+        for name in ("peft", "bitsandbytes"):
+            if _module_missing(name):
+                wanted.append(name)
+
+    if not wanted:
+        emit("deps: nothing to install")
+        return 0
+
+    emit(f"deps: installing {wanted} (missing for this run)")
+    return stream_command(
+        (sys.executable, "-m", "pip", "install", "-q", *wanted),
+        pathlib.Path(options.log_root) / "deps.log",
+        emit,
+    )
+
+
 def _check_token(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
     """Refuse a publishing run without a token, before anything is downloaded.
 
@@ -568,10 +604,11 @@ def _serve_and_generate(options: argparse.Namespace, emit: Callable[[str], None]
         if module and _module_missing(module):
             raise DatasetError(
                 f"the sampling stage needs `{module}`, which is not installed. Install "
-                f"it ({sys.executable} -m pip install {module.split('.')[0]}) or run with "
-                "--no-serve against a server you started yourself. Without samples there "
-                "are no preference pairs, and preference optimisation would have nothing "
-                "to learn from."
+                f"it ({sys.executable} -m pip install {module.split('.')[0]}), drop "
+                "--no-install-deps so the pipeline does it, or run with --no-serve "
+                "against a server you started yourself. Without samples there are no "
+                "preference pairs, and preference optimisation would have nothing to "
+                "learn from."
             )
     server: Any = None
     try:
@@ -861,6 +898,18 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
         )
 
     if options.run_eval:
+        # Installing the sampling dependencies comes after the training stage and before
+        # the one that needs them: `pip install vllm` can move torch, so it must not run
+        # underneath a training job, and it must not run so late that a failure costs the
+        # evaluation as well as the install.
+        if options.install_deps:
+            stages.append(
+                Stage(
+                    "deps",
+                    ("in-process", "install what the evaluation needs, if it is missing"),
+                    run=lambda emit: _install_dependencies(options, emit),
+                )
+            )
         # One stage, because it is the only thing here that needs two processes at
         # once: the agent loop asks a model server for completions and runs the Go it
         # produces. The server is started and stopped inside the stage, so it cannot
@@ -1041,6 +1090,11 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--serve-timeout", type=int, default=1800)
     parser.add_argument("--no-serve", action="store_true", help="assume a server is already up")
     parser.add_argument(
+        "--no-install-deps",
+        action="store_true",
+        help="never install anything; fail with the command to run instead",
+    )
+    parser.add_argument(
         "--serve-command",
         nargs=argparse.REMAINDER,
         default=["python", "-m", "vllm.entrypoints.openai.api_server"],
@@ -1118,6 +1172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_repo=not args.no_repo,
         run_tasks=not args.no_tasks,
         mutate=not args.no_mutate,
+        install_deps=not args.no_install_deps,
         run_data=not args.no_data,
         run_sft=not args.no_sft,
         run_eval=not args.no_eval,

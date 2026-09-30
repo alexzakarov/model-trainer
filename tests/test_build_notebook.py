@@ -48,13 +48,18 @@ def _cell_containing(marker: str) -> dict[str, object]:
 
 
 def install_cell() -> dict[str, object]:
-    """The cell that pulls and installs, found by what it does rather than by index."""
+    """The cell that pulls and installs, found by what it does rather than by index.
+
+    Identified by ``pip install`` *and* ``sys.path``. The parameters cell mentions an
+    install in a comment and carries a repository URL, so "pip install" and "git" alone
+    matched it -- which made three unrelated tests read the wrong cell and pass or fail
+    for the wrong reason.
+    """
     for cell in build_cells():
-        if (
-            cell["cell_type"] == "code"
-            and "pip install" in sources(cell)
-            and "git" in sources(cell)
-        ):
+        if cell["cell_type"] != "code":
+            continue
+        source = sources(cell)
+        if "pip install" in source and "sys.path" in source:
             return cell
     raise AssertionError("no cell pulls and installs the repository")
 

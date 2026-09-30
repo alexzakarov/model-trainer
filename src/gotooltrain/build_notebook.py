@@ -147,9 +147,14 @@ TRAINING_MODE = ""          # tam fine-tune. "qlora" araca bağlı, bu defterin 
 # checkpoint servis edilir, örnekler toplanır, tercih çiftleri çıkarılır ve DPO
 # çalışır.
 #
-# True olduğunda **ek olarak** gerekir: `vllm` kurulu olması ve 40 GB'lık kartta iki
-# aşamanın sırayla sığması (önce SFT, sonra servis). Sunucu açılmazsa hata
-# `runs/pipeline/server.log` içinde sebebiyle durur.
+# True olduğunda gereken ek şeyler `deps` aşaması tarafından **kurulur**: eksikse
+# `vllm` (ve qlora için `peft` + `bitsandbytes`). Kurulum SFT'ten *sonra*, eval'den
+# *önce* yapılıyor: `pip install vllm` torch'u oynatabilir, ve eğitimin altında
+# oynayan bir kurulumun başarısızlığının iki olası sebebi olur. Sıralama bu yüzden
+# seçildi, ve checkpoint o noktada zaten Hub'a gitmiş olur.
+#
+# Kurulumu istemezsen `--no-install-deps` var; o zaman eval aşaması çalıştırılacak
+# komutu adıyla söyleyip durur.
 #
 # False bırakılırsa aşama **adıyla** atlanır; sessizce yok sayılmaz. Koşu hücresi
 # hangi durumda olduğunu komuttan önce yazar.
@@ -684,7 +689,7 @@ command = [
 # ekleniyordu ve okuyan kişi bunu yalnızca komut satırına bakarak çıkarabiliyordu.
 if RUN_PREFERENCE_STAGE:
     print("tercih aşaması: AÇIK (klon -> görev -> eval -> preferences -> DPO)")
-    print("  ek gereksinim: vllm kurulu olmalı ve sunucu karta sığmalı")
+    print("  eksik bağımlılıklar (vllm; qlora ise peft+bitsandbytes) deps aşamasında kurulacak")
 else:
     command += ["--no-eval", "--no-dpo"]
     print("tercih aşaması: KAPALI (RUN_PREFERENCE_STAGE=False)")

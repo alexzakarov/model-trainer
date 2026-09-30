@@ -198,6 +198,7 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         run_tasks=True,
         mutate=True,
         mutations=1,
+        install_deps=True,
         log_root=tmp_path / "logs",
         model_name="policy",
         revision="sft-8192",
@@ -209,7 +210,12 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         vllm_port=8000,
         serve_timeout=5,
         serve=True,
-        serve_command=["python", "-m", "vllm.entrypoints.openai.api_server"],
+        # A placeholder, and an importable one on purpose: the lifecycle tests fake
+        # Popen, so the command is never run -- but the dependency check reads the
+        # module name off it, and a test that named vllm would fail on a machine that
+        # does not have vllm installed. Which is every machine this repository's own
+        # gate runs on, as Colab demonstrated.
+        serve_command=["python", "-m", "json"],
         run_corpus=True,
         run_data=True,
         run_sft=True,
@@ -805,6 +811,114 @@ def test_the_packages_it_broke_are_reported(
     assert any("b" in line for line in lines), lines
 
 
+def test_only_what_is_missing_is_installed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that already has these pays nothing, and the log says so either way.
+
+    Installing unconditionally would re-download a multi-gigabyte wheel on every run,
+    and a run that installs packages without saying so is one whose success cannot be
+    reproduced.
+    """
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        pipe, "stream_command", lambda command, log, emit: calls.append(tuple(command)) or 0
+    )
+    monkeypatch.setattr(pipe, "_module_missing", lambda name: False)
+    lines: list[str] = []
+    assert pipe._install_dependencies(options(tmp_path), lines.append) == 0
+    assert calls == [], "it installed something that was already there"
+    assert any("nothing to install" in line for line in lines), lines
+
+
+def test_a_missing_sampling_dependency_is_installed_by_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The distribution is named from the module the serve command uses.
+
+    Guessing a different name fails as "no matching distribution", which is a message a
+    reader cannot act on.
+    """
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        pipe, "stream_command", lambda command, log, emit: calls.append(tuple(command)) or 0
+    )
+    monkeypatch.setattr(pipe, "_module_missing", lambda name: True)
+    assert (
+        pipe._install_dependencies(
+            options(tmp_path, serve_command=["python", "-m", "vllm.entrypoints.openai.api_server"]),
+            lambda m: None,
+        )
+        == 0
+    )
+    assert calls and "vllm" in calls[0]
+    assert "-q" in calls[0]
+
+    # A qlora run needs its own two, and they are installed in the same call. One is
+    # present and one is missing, because a host that has one usually has the other --
+    # and the missing one is what the loop has to pick up.
+    calls.clear()
+    monkeypatch.setattr(pipe, "_module_missing", lambda name: name != "peft")
+    assert pipe._install_dependencies(options(tmp_path, training_mode="qlora"), lambda m: None) == 0
+    assert "bitsandbytes" in calls[0], calls
+    assert "peft" not in calls[0], calls
+
+
+def test_an_external_server_needs_no_sampling_dependency(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--no-serve means someone else runs the server, so this host installs nothing for it.
+
+    Asking for a package the run never imports is how a check gets ignored.
+    """
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        pipe, "stream_command", lambda command, log, emit: calls.append(tuple(command)) or 0
+    )
+    monkeypatch.setattr(pipe, "_module_missing", lambda name: True)
+    lines: list[str] = []
+    assert pipe._install_dependencies(options(tmp_path, serve=False), lines.append) == 0
+    assert calls == [], "it installed a server it was told not to run"
+    assert any("nothing to install" in line for line in lines), lines
+
+
+def test_the_dependencies_are_installed_after_training_and_before_sampling(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pip install vllm` can move torch.
+
+    Underneath a training job that is two possible causes for one failure; before the
+    training job it would cost the checkpoint that has not been written yet. Between them
+    it costs the preference chain, and the checkpoint is already on the Hub.
+    """
+    names = [stage.name for stage in pipe.build_stages(options(tmp_path))]
+    assert names.index("sft") < names.index("deps") < names.index("eval")
+
+
+def test_the_installation_can_be_refused_and_then_the_command_is_named(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--no-install-deps is for a host whose environment is not to be touched.
+
+    Then the sampling stage has to fail with the command to run, not with a dead process.
+    """
+    names = [stage.name for stage in pipe.build_stages(options(tmp_path, install_deps=False))]
+    assert "deps" not in names
+    assert "eval" in names, "refusing the install must not remove the stage that needs it"
+
+    import importlib.util
+
+    def raises(name: str) -> Any:
+        raise ModuleNotFoundError("no vllm here")
+
+    monkeypatch.setattr(importlib.util, "find_spec", raises)
+    with pytest.raises(DatasetError, match="drop --no-install-deps"):
+        pipe._serve_and_generate(
+            options(tmp_path, serve_command=["python", "-m", "vllm.entrypoints.openai.api_server"]),
+            lambda m: None,
+        )
+
+
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:
     """Each stage consumes what the one before it produced.
 
@@ -825,6 +939,7 @@ def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.
         "repo",
         "mutate",
         "tasks",
+        "deps",
         "eval",
         "preferences",
         "dpo",
