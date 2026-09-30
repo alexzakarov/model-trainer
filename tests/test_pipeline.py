@@ -167,7 +167,7 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         dpo_output=str(tmp_path / "dpo"),
         dataset=tmp_path / "data.jsonl",
         corpus=tmp_path / "corpus.jsonl",
-        source_split=tmp_path / "split.json",
+        split_dir=tmp_path / "splits",
         dapt=tmp_path / "dapt.jsonl",
         dapt_report=tmp_path / "dapt.json",
         pairs=tmp_path / "pairs.jsonl",
@@ -185,11 +185,13 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
         grad_accum=8,
         learning_rate=1e-5,
         max_records=400,
+        max_tokens_per_record=8192,
         n_samples=4,
         extra_sft=[],
         extra_dpo=[],
         run_gate=True,
         run_corpus=True,
+        run_data=True,
         run_sft=True,
         run_eval=True,
         run_dpo=True,
@@ -199,18 +201,66 @@ def options(tmp_path: pathlib.Path, **overrides: object) -> argparse.Namespace:
     return args
 
 
+def test_an_in_process_stage_runs_and_stops_the_chain_when_it_refuses(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Work in this interpreter is still a stage, and still has to stop the chain.
+
+    Preparing the corpus happens here rather than in a subprocess because it is cheap.
+    That must not cost it its place in the plan, its log entry, or the guarantee that
+    an empty corpus ends the run with an explanation instead of a trainer error later.
+    """
+    from gotooltrain.errors import DatasetError as Refusal
+
+    def refuses(emit: Any) -> int:
+        emit("measuring")
+        raise Refusal("none of them usable")
+
+    lines: list[str] = []
+    pipeline = Pipeline(
+        [
+            Stage("sft-data", ("in-process", "label"), run=refuses),
+            Stage("after", (sys.executable, "-c", "print('SHOULD NOT APPEAR')")),
+        ],
+        emit=lines.append,
+        log_root=tmp_path,
+    )
+    assert pipeline.run() == 2
+    joined = "\n".join(lines)
+    assert "SHOULD NOT APPEAR" not in joined, "the chain continued past a refused stage"
+    assert "none of them usable" in joined
+    assert json.loads((tmp_path / "last_failure.json").read_text(encoding="utf-8"))["stage"] == (
+        "sft-data"
+    )
+
+
+def test_an_in_process_stage_without_work_says_so_rather_than_reporting_success(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stage that is declared but not wired must fail loudly on the first run."""
+    pipeline = Pipeline(
+        [Stage("empty", ("in-process", "label"))],
+        emit=lambda message: None,
+        log_root=tmp_path,
+    )
+    with pytest.raises(DatasetError, match="carries no work"):
+        pipeline._run_in_process(pipeline.stages[0])  # the branch under test
+
+
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:
     """Each stage consumes what the one before it produced.
 
     Quality gate first so a broken checkout is caught in a minute rather than after the
-    corpus download; corpus before the data that is built from it; the evaluation
-    between the checkpoint and the pairs, because a preference pair is two attempts at
-    the same task and there is nothing to compare until they exist.
+    corpus download; the corpus before the data built from it, and that data before the
+    stage that trains on it; the evaluation between the checkpoint and the pairs,
+    because a preference pair is two attempts at the same task and there is nothing to
+    compare until they exist.
     """
     names = [stage.name for stage in pipe.build_stages(options(tmp_path))]
     assert names == [
         "quality-gate",
         "corpus",
+        "sft-data",
         "sft",
         "eval-queue",
         "eval-judge",
@@ -227,7 +277,7 @@ def test_a_switched_off_stage_disappears_from_the_chain(tmp_path: pathlib.Path) 
     names = [
         stage.name for stage in pipe.build_stages(options(tmp_path, run_eval=False, run_dpo=False))
     ]
-    assert names == ["quality-gate", "corpus", "sft"]
+    assert names == ["quality-gate", "corpus", "sft-data", "sft"]
     assert not any("eval" in name or "dpo" in name or name == "preferences" for name in names)
 
 
@@ -310,19 +360,127 @@ def test_a_dry_run_prints_the_plan_and_runs_nothing(tmp_path: pathlib.Path, caps
     assert "[dry]" in out, f"the stages were not marked as rehearsals: {out}"
 
 
+def test_the_corpus_can_be_re_measured_without_re_running_the_chain(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A separate entry point, because re-measuring is cheap and the pipeline is not.
+
+    Re-running the gate and the corpus download to change one filter would cost minutes
+    and change nothing else, so the measurement is also reachable on its own.
+    """
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(DatasetError, match="No data to train on"):
+        pipe.main(
+            [
+                "prepare-data",
+                "--corpus",
+                str(empty),
+                "--dataset",
+                str(tmp_path / "sft.jsonl"),
+            ]
+        )
+
+
+def _tiny_corpus(path: pathlib.Path) -> pathlib.Path:
+    """One usable record, so the preparation path can actually succeed."""
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "make the test pass"},
+                    {"role": "assistant", "content": "Tests pass."},
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_the_data_stage_writes_the_corpus_the_next_stage_reads(tmp_path: pathlib.Path) -> None:
+    """The happy path, which is the one a run depends on.
+
+    The refusals are tested elsewhere; what matters here is that the stage returns
+    success and leaves the file behind, because the trainer's input is that file and
+    nothing else in the chain writes it.
+    """
+    source = _tiny_corpus(tmp_path / "corpus.jsonl")
+    destination = tmp_path / "sft.jsonl"
+    lines: list[str] = []
+
+    assert (
+        pipe.main(
+            [
+                "prepare-data",
+                "--corpus",
+                str(source),
+                "--dataset",
+                str(destination),
+                "--max-records",
+                "10",
+            ]
+        )
+        == 0
+    )
+    assert destination.is_file() and destination.read_text(encoding="utf-8").strip()
+
+    # And the stage's own callable reaches the same file from the same options.
+    stage = next(s for s in pipe.build_stages(options(tmp_path)) if s.name == "sft-data")
+    assert stage.run is not None
+    options(tmp_path).corpus = source
+    assert stage.run(lines.append) == 0
+    assert any("wrote" in line for line in lines)
+
+
+def test_the_data_stage_reads_the_same_switches_as_the_rest_of_the_chain(
+    tmp_path: pathlib.Path,
+) -> None:
+    """One place decides where the corpus is and how long a record may be.
+
+    A second hard-coded copy of those paths would mean a reader who changes
+    ``--corpus`` watches the run prepare one file and train on another. Proved by
+    running the stage's own callable against the file the options name: if it were
+    reading a path of its own, this refusal would not name that one.
+    """
+    stage = next(s for s in pipe.build_stages(options(tmp_path)) if s.name == "sft-data")
+    assert stage.run is not None
+    # Nothing at `options.corpus`, so the refusal names the path it looked at.
+    with pytest.raises(DatasetError, match=r"corpus\.jsonl"):
+        stage.run(lambda message: None)
+
+
+def test_the_corpus_stage_produces_the_input_it_reads(tmp_path: pathlib.Path) -> None:
+    """A stage must not depend on a file some other cell happened to leave behind.
+
+    This failed for real: the corpus stage named a split file, the cell that fetched
+    it had been folded away when the notebook collapsed, and the run stopped after the
+    gate had already passed with "Go-UT-Bench split not found". The gate being green
+    first is what made it look like something else.
+    """
+    command = " ".join(
+        next(s for s in pipe.build_stages(options(tmp_path)) if s.name == "corpus").command
+    )
+    assert "--download-to" in command, "the stage fetches its own input"
+    assert "--source" not in command, "and does not depend on a path nothing produces"
+
+
 def test_every_module_the_pipeline_names_actually_exists(tmp_path: pathlib.Path) -> None:
     """A stage that names a module that is not installed fails after the gate passes.
 
-    This is not hypothetical: the corpus stage named ``gotooltrain.data`` while the
-    module is ``gotooltrain.datacli``. Every other test here asserted on the command
-    *strings*, and a string can be perfectly well formed and still name nothing. The
-    gate ran, passed, and the run then stopped two stages in with
-    "No module named gotooltrain.data" -- the reader's first thought would have been
+        This is not hypothetical: the corpus stage named ``gotooltrain.data`` while the
+        module is ``gotooltrain.datacli``. Every other test here asserted on the command
+        *strings*, and a string can be perfectly well formed and still name nothing. The
+        gate ran, passed, and the run then stopped two stages in with
+        "No module named gotooltrain.data" -- the reader's first thought would have been
     that the install was broken.
     """
-    import importlib
+    import importlib.util
 
     for stage in pipe.build_stages(options(tmp_path)):
+        if "-m" not in stage.command:
+            continue  # an in-process stage runs here; it has no command line to check
         for index, token in enumerate(stage.command):
             if token == "-m":
                 name = stage.command[index + 1]
@@ -363,6 +521,8 @@ def test_every_flag_the_pipeline_passes_is_one_the_cli_defines(tmp_path: pathlib
 
     stages = pipe.build_stages(options(tmp_path))
     for stage in stages:
+        if "-m" not in stage.command:
+            continue  # an in-process stage runs here; it has no command line to check
         index = stage.command.index("-m")
         module_name = stage.command[index + 1]
         rest = stage.command[index + 2 :]
@@ -517,7 +677,10 @@ def test_selecting_nothing_is_reported_rather_than_silently_succeeding(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A pipeline with no stages has not succeeded at anything."""
-    assert pipe.main(["--no-gate", "--no-corpus", "--no-sft", "--no-eval", "--no-dpo"]) == 0
+    assert (
+        pipe.main(["--no-gate", "--no-corpus", "--no-data", "--no-sft", "--no-eval", "--no-dpo"])
+        == 0
+    )
     assert "nothing to do" in capsys.readouterr().out
 
 

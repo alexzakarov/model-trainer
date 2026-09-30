@@ -170,6 +170,40 @@ def test_the_measurement_accounts_for_every_record_it_read(tmp_path: pathlib.Pat
     )
 
 
+def test_prepare_data_writes_a_file_the_training_stage_can_read(tmp_path: pathlib.Path) -> None:
+    """The measured corpus has to land in the shape the next stage reads.
+
+    The stage that measures and the stage that trains are separated by a file on disk,
+    which means the writing half has to be tested against the *reading* half rather
+    than against its own idea of the format. This is the stage that produces the input
+    the trainer consumes, so a shape mismatch here stops the run one stage later with
+    a confusing error.
+    """
+    from gotooltrain.pipeline import prepare_data
+
+    source = corpus(tmp_path, [conversation("Tests pass."), conversation("Also passing.")])
+    destination = tmp_path / "sft.jsonl"
+    lines: list[str] = []
+    report = prepare_data(
+        source,
+        destination,
+        max_records=10,
+        max_tokens_per_record=8192,
+        tokenizer_name="Qwen/Qwen3.5-4B",
+        emit=lines.append,
+    )
+
+    assert report["kept"] == 2
+    written = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert len(written) == 2
+    for record in written:
+        assert set(record) == {"messages", "tools"}
+        assert isinstance(record["messages"], list)
+    # And the counts are on screen, because a reader who cannot see how many records
+    # survived has no idea whether the run trains on the corpus they think it does.
+    assert any("kept" in line for line in lines)
+
+
 def test_the_measured_share_is_what_the_vocabulary_term_needs(tmp_path: pathlib.Path) -> None:
     """The memory budget multiplies the vocabulary term by this number.
 

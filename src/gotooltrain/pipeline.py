@@ -59,6 +59,10 @@ class Stage:
     #: rehearsal failing; an evaluation failing may be reportable and not fatal,
     #: because it produces a report either way.
     fatal: bool = True
+    #: Work done in this interpreter instead of another command. Only set for a stage
+    #: whose ``command`` is the placeholder ``("in-process", <label>)`` -- the label is
+    #: there so a dry run can still print something, not to be dispatched on.
+    run: Callable[[Callable[[str], None]], int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +108,7 @@ class Pipeline:
             if dry_run:
                 self.emit(f"[dry] {stage.name}: {' '.join(stage.command)}")
                 continue
-            code = self._one(stage)
+            code = self._run_in_process(stage) if stage.run is not None else self._one(stage)
             if code != 0 and stage.fatal:
                 self.emit(
                     f"\nPIPELINE STOPPED at {stage.name} ({code}). "
@@ -115,6 +119,24 @@ class Pipeline:
                 self._record_failure(stage, code)
                 return code
         return 0
+
+    def _run_in_process(self, stage: Stage) -> int:
+        """A stage that is work in this interpreter rather than another command.
+
+        Only one: preparing the corpus. It is cheap, and a second interpreter start
+        would reload the tokenizer for no reason. It is still a stage, because a stage
+        is what appears in the plan, stops the chain when it fails, and gets a log.
+        """
+        self.emit(f"\n=== {stage.name} ===")
+        if stage.run is None:
+            raise DatasetError(f"stage {stage.name} is in-process but carries no work to do")
+        try:
+            return int(stage.run(self.emit))
+        except DatasetError as exc:
+            # A refusal, not a crash: the chain stops and says why, which is the whole
+            # reason an empty corpus is caught here rather than by the trainer.
+            self.emit(f"{stage.name} refused: {exc}")
+            return 2
 
     def _record_failure(self, stage: Stage, code: int) -> None:
         """Name the failed stage where a caller can read it."""
@@ -341,6 +363,24 @@ def measure_dataset(
     }
 
 
+def _write_sft_data(options: argparse.Namespace, emit: Callable[[str], None]) -> int:
+    """Prepare the training corpus from the options this run was given.
+
+    A closure rather than fixed paths: the stage reads the same ``--corpus`` and
+    ``--model`` the rest of the chain does, so a reader changing one switch does not
+    have to find a second hard-coded copy of it.
+    """
+    prepare_data(
+        pathlib.Path(options.corpus),
+        pathlib.Path(options.dataset),
+        max_records=options.max_records,
+        max_tokens_per_record=options.max_tokens_per_record,
+        tokenizer_name=options.model,
+        emit=emit,
+    )
+    return 0
+
+
 def build_stages(options: argparse.Namespace) -> list[Stage]:
     """The chain, in the order it has to happen, from the options given."""
     sft = options.sft_output
@@ -356,8 +396,8 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                     "-m",
                     "gotooltrain.datacli",
                     "go-pairs",
-                    "--source",
-                    str(options.source_split),
+                    "--download-to",
+                    str(options.split_dir),
                     "--out",
                     str(options.dapt),
                     "--report",
@@ -367,6 +407,19 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                 ),
             )
         )
+    if options.run_data:
+        # Runs in this process, not a subprocess: the measurement is cheap, the
+        # tokenizer is already in memory for nothing else, and an extra interpreter
+        # start here would be pure overhead. It is a stage so that it appears in the
+        # plan, stops the chain on an empty corpus, and has its own log entry.
+        stages.append(
+            Stage(
+                "sft-data",
+                ("in-process", "measure, filter and write data/sft.jsonl"),
+                run=lambda emit: _write_sft_data(options, emit),
+            )
+        )
+
     if options.run_sft:
         stages.append(
             Stage(
@@ -536,6 +589,47 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
     return stages
 
 
+def prepare_data(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    *,
+    max_records: int,
+    max_tokens_per_record: int,
+    tokenizer_name: str,
+    emit: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    """Measure, filter and write the corpus the training stage will read.
+
+    Writing belongs here rather than in a notebook cell because the file is an input
+    to the next stage: a stage that depends on a file some other cell left behind is
+    how the run stopped with "split not found" and would have stopped again with
+    "no such dataset" one stage later. The counts are printed because a reader who
+    cannot see how many records survived the filter has no idea whether the run is
+    training on the corpus they think it is.
+    """
+    report = measure_dataset(
+        source,
+        max_records=max_records,
+        max_tokens_per_record=max_tokens_per_record,
+        tokenizer_name=tokenizer_name,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8", newline="\n") as handle:
+        for record in report["examples"]:
+            handle.write(json.dumps(record) + "\n")
+
+    emit(
+        f"corpus: {report['kept']}/{report['records_read']} kept, "
+        f"{report['dropped_truncated']} truncated, {report['dropped_invalid']} invalid"
+    )
+    emit(
+        f"tokens: {report['total_tokens']} total, {report['supervised_tokens']} supervised "
+        f"({report['supervised_share']:.1%}); longest {report['longest']}"
+    )
+    emit(f"wrote {destination}")
+    return report
+
+
 def add_common(parser: argparse.ArgumentParser) -> None:
     """Options that describe the run rather than one stage."""
     parser.add_argument("--model", default="Qwen/Qwen3.5-4B")
@@ -544,7 +638,10 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset", default="data/sft.jsonl", type=pathlib.Path)
     parser.add_argument("--corpus", default="data/go-unit-tests.jsonl", type=pathlib.Path)
     parser.add_argument(
-        "--source-split", default="data/go-ut-bench/train_data.json", type=pathlib.Path
+        "--split-dir",
+        default="data/go-ut-bench",
+        type=pathlib.Path,
+        help="where the published splits are fetched; the stage produces its own input",
     )
     parser.add_argument("--dapt", default="data/go-dapt.jsonl", type=pathlib.Path)
     parser.add_argument("--dapt-report", default="data/go-dapt-report.json", type=pathlib.Path)
@@ -565,6 +662,12 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--max-records", type=int, default=400)
+    parser.add_argument(
+        "--max-tokens-per-record",
+        type=int,
+        default=8192,
+        help="a record that reaches this ceiling has been truncated, and is dropped",
+    )
     parser.add_argument("--n-samples", type=int, default=4)
     parser.add_argument(
         "--hub-repo", default=DEFAULT_HUB_REPO, help="the repository auto-resume consults"
@@ -573,11 +676,19 @@ def add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the pipeline. Returns a process exit code."""
+    """Run the pipeline, or prepare the corpus on its own."""
     parser = argparse.ArgumentParser(prog="gotooltrain-pipeline", description=__doc__)
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=("run", "prepare-data"),
+        help="run the chain, or only measure and write the training corpus",
+    )
     add_common(parser)
     parser.add_argument("--no-gate", action="store_true")
     parser.add_argument("--no-corpus", action="store_true")
+    parser.add_argument("--no-data", action="store_true")
     parser.add_argument("--no-sft", action="store_true")
     parser.add_argument("--no-eval", action="store_true")
     parser.add_argument("--no-dpo", action="store_true")
@@ -596,6 +707,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     values.update(
         run_gate=not args.no_gate,
         run_corpus=not args.no_corpus,
+        run_data=not args.no_data,
         run_sft=not args.no_sft,
         run_eval=not args.no_eval,
         run_dpo=not args.no_dpo,
@@ -608,6 +720,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     # notebook cell that used to hold it. Every caller gets the same decision.
     options.extra_sft = resolve_resume(options.extra_sft, repo_id=options.hub_repo)
     options.extra_dpo = resolve_resume(options.extra_dpo, repo_id=options.hub_repo)
+
+    if args.command == "prepare-data":
+        # Its own entry point so the corpus can be re-measured without re-running the
+        # gate and the download. The measurement is cheap; the pipeline is not.
+        prepare_data(
+            options.corpus,
+            options.dataset,
+            max_records=options.max_records,
+            max_tokens_per_record=options.max_tokens_per_record,
+            tokenizer_name=options.model,
+        )
+        return 0
+
     stages = build_stages(options)
     if not stages:
         print("no stages selected; nothing to do")
