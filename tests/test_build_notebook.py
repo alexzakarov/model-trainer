@@ -526,6 +526,97 @@ def test_the_notebook_does_not_claim_a_resume_restores_the_run() -> None:
     assert "ikinci kez" in parameters, "the same examples are seen again"
 
 
+def _auto_resume_block() -> str:
+    """The shipped resume-resolution code, lifted out of the generated notebook.
+
+    Not copied: a copy would pass while the notebook disagreed with it, which is
+    the failure this project keeps paying for. Whatever the reader runs is what runs
+    here.
+    """
+    for cell in build_cells():
+        source = sources(cell)
+        if cell["cell_type"] == "code" and "WEIGHT_FILES = " in source:
+            return source[source.index("WEIGHT_FILES = ") :]
+    raise AssertionError("no cell resolves RESUME_FROM")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("weights_present", "ornek/repo"),
+        ("repo_empty", ""),
+        ("query_fails", ""),
+        ("network_down", ""),
+    ],
+)
+def test_the_default_resume_preserves_a_checkpoint_that_already_exists(
+    case: str, expected: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The default has to be the choice that cannot lose work.
+
+    A push replaces the repository, so "start from the base model" is not a neutral
+    default when a trained checkpoint is already there -- it destroys it at the
+    first push. Asking the Hub what is there costs one API call and turns the
+    dangerous default into the safe one.
+    """
+    hub = pytest.importorskip("huggingface_hub")
+
+    files: set[str] | Exception
+    if case == "weights_present":
+        files = {"model.safetensors", "config.json"}
+    elif case == "repo_empty":
+        files = {"README.md"}
+    elif case == "query_fails":
+        files = RuntimeError("401 unauthorized")
+    else:
+        files = ConnectionError("name resolution failed")
+
+    class Stub:
+        def list_repo_files(self, repo_id: str) -> list[str]:
+            del repo_id
+            if isinstance(files, Exception):
+                raise files
+            return sorted(files)
+
+    monkeypatch.setattr(hub, "HfApi", Stub)
+    namespace: dict[str, object] = {"RESUME_FROM": "auto", "HF_REPO_ID": "ornek/repo"}
+    exec(compile(_auto_resume_block(), "cell5", "exec"), namespace)  # noqa: S102
+
+    assert namespace["RESUME_FROM"] == expected
+    out = capsys.readouterr().out
+    if case == "weights_present":
+        assert "kaldığın yerden devam" in out
+    elif case == "repo_empty":
+        assert "yeni repo" in out
+    else:
+        # Not knowing is not the same as there being nothing, and the two look
+        # identical from the outside. Only one of them is true, and the difference
+        # is otherwise discovered at the first push, after the work is done.
+        assert "BİLMİYORUM" in out, f"a failed query was reported as an empty repo: {out!r}"
+        assert "ezecek" in out, "the reader was not told what the fallback risks"
+
+
+def test_an_explicit_empty_resume_is_honoured_rather_than_second_guessed() -> None:
+    """Starting over is a legitimate instruction, even when a checkpoint exists.
+
+    Auto-detection must not override a decision the reader made on purpose -- but
+    the notebook still says what that decision will cost.
+    """
+    namespace: dict[str, object] = {"RESUME_FROM": "", "HF_REPO_ID": "ornek/repo"}
+    exec(compile(_auto_resume_block(), "cell5", "exec"), namespace)  # noqa: S102
+    assert namespace["RESUME_FROM"] == ""
+
+
+def test_an_explicit_repo_id_is_used_without_being_second_guessed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Naming a repo is a decision; querying the Hub must not replace it."""
+    namespace: dict[str, object] = {"RESUME_FROM": "baska/repo:v2", "HF_REPO_ID": "ornek/repo"}
+    exec(compile(_auto_resume_block(), "cell5", "exec"), namespace)  # noqa: S102
+    assert namespace["RESUME_FROM"] == "baska/repo:v2"
+    assert "elle seçildi" in capsys.readouterr().out
+
+
 def test_an_existing_checkpoint_is_never_overwritten_without_a_word() -> None:
     """A push replaces the repository, so overwriting is a data-loss event.
 

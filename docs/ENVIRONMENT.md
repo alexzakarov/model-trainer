@@ -92,7 +92,7 @@ make check
 ```
 
 ```
-pytest + coverage : 1018 passed, 22 skipped (Docker'suz Windows) / 1038 (hepsi kurulu)
+pytest + coverage : 1024 passed, 22 skipped (Docker'suz Windows) / 1044 (hepsi kurulu)
 coverage          : %100 statement + branch (3693 satır, 1008 dal)
 ruff check        : temiz
 ruff format       : 72 dosya hazır

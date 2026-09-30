@@ -99,10 +99,13 @@ MEMORY_BUDGET_GB = 40.0
 #
 # DİKKAT: boş bırakırsan ve repoda zaten bir checkpoint varsa, ilk push'ta (25.
 # adım) o checkpoint'in üzerine **yazılır** — 25 adım ilerlemiş taban model
-# göndereceksin. Geri dönüşü olmayan bir hata. 12. hücre ne gönderileceğini
-# söyler.
+# göndereceksin. Geri dönüşü olmayan bir hata. Varsayılan "auto" bunu kendiliğinden
+# çözer: 5. hücre repoyu sorar, ağırlık varsa devam eder, yoksa sıfırdan başlar.
+# Yine de yazılıyor, çünkü bu hücrenin ne yapacağını okumadan çalıştırmak da
+# bir tercih, ve 12. hücre ne gönderileceğini yine de söyler.
 
-RESUME_FROM = ""                       # aşağıda "resume :" satırı ne yazıyorsa o
+RESUME_FROM = "auto"   # "auto" = repoda checkpoint varsa devam et | "" = bilerek
+                       # sıfırdan | bir repo id ya da revizyon = elle seç
 
 EXPANDABLE_SEGMENTS = True               # parçalanmayı azaltır (bkz. 4. hücre)
 EPOCHS = 1
@@ -549,6 +552,42 @@ from huggingface_hub import login
 
 login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
 print("hub client hazır")
+
+# ---------------------------------------------------------------- nereden devam
+#
+# RESUME_FROM = "auto" ise karar burada veriliyor: repoda gerçek ağırlık var mı?
+# Sıfır bırakmıyorum, çünkü tahmin edilebilir taraf şu: repoda bir checkpoint
+# varsa onu devralmak, yoksa sıfırdan başlamak. Tersi, yani "sorma, sıfırdan
+# başla", mevcut olanı **silme** demek.
+#
+# Kural aynı: sessiz düşüş yok. Sorgu başarısız olursa (token yok, ağ yok, repo
+# yok) bu "checkpoint yok" demek değildir — "bilmiyorum" demektir. Bilmiyorum ile
+# yok arasındaki fark, 25. adımda anlaşılır; o zaman fazla çalışmış olur.
+
+WEIGHT_FILES = {"model.safetensors", "model.safetensors.index.json", "pytorch_model.bin"}
+
+if RESUME_FROM == "auto":
+    from huggingface_hub import HfApi
+
+    try:
+        _dosyalar = set(HfApi().list_repo_files(HF_REPO_ID))
+    except Exception as _exc:  # noqa: BLE001 - her hata "bilmiyorum" demektir
+        RESUME_FROM = ""
+        print(f"\\nauto: {HF_REPO_ID} sorulamadı ({type(_exc).__name__}) — BİLMİYORUM.")
+        print("  Repoda checkpoint olabilir. Varsa ilk push onu ezecek.")
+        print(f"  Emin değilsen RESUME_FROM = \\"{HF_REPO_ID}\\" yazıp yeniden çalıştır.")
+    else:
+        if WEIGHT_FILES & _dosyalar:
+            RESUME_FROM = HF_REPO_ID
+            print(f"\\nauto: {HF_REPO_ID} içinde ağırlık var -> kaldığın yerden devam.")
+        else:
+            RESUME_FROM = ""
+            print(f"\\nauto: {HF_REPO_ID} boş (yeni repo) -> taban modelden sıfırdan.")
+elif RESUME_FROM:
+    print(f"\\ndevam: elle seçildi -> {RESUME_FROM}")
+else:
+    print("\\ndevam: yok. Bilerek sıfırdan; repoda checkpoint varsa ilk push ezecek.")
+
 """
         ),
         _code(
