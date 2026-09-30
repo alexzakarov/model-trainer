@@ -1234,6 +1234,71 @@ def test_the_plan_refuses_an_unknown_loss_mode() -> None:
         plan(loss_mode="magic")
 
 
+def test_a_second_model_costs_weights_and_nothing_else() -> None:
+    """Preference optimisation holds the weights twice and the gradients once.
+
+    The reference model is frozen, so it has no gradient buffer and no optimiser
+    state. Getting either wrong moves the answer in a direction that only shows up
+    on a full card: doubling everything over-refuses, doubling the weights alone
+    under-refuses.
+    """
+    facts = {"hidden": 2560, "layers": 32, "vocab": 248320, "state_bytes_per_token": 1 << 20}
+    one = estimate_memory(
+        facts,
+        parameters=4_330_000_000,
+        context_length=4096,
+        supervised_share=0.32,
+        gradient_checkpointing=True,
+        optimiser="adafactor",
+    )
+    two = estimate_memory(
+        facts,
+        parameters=4_330_000_000,
+        context_length=4096,
+        supervised_share=0.32,
+        gradient_checkpointing=True,
+        optimiser="adafactor",
+        models=2,
+    )
+    assert two.weights == pytest.approx(one.weights * 2, rel=1e-6)
+    assert two.gradients == pytest.approx(one.gradients, rel=1e-6)
+    assert two.optimiser == pytest.approx(one.optimiser, rel=1e-6)
+    # Activations are counted for the trained model: the reference runs under
+    # no_grad, so its peak is transient and it stores nothing to recompute.
+    assert two.stored_activations == pytest.approx(one.stored_activations, rel=1e-6)
+    assert two.resident == pytest.approx(one.resident + one.weights, rel=1e-6)
+    assert two.models == 2
+
+
+def test_a_run_holds_at_least_one_model() -> None:
+    facts = {"hidden": 8, "layers": 1, "vocab": 8}
+    with pytest.raises(ValueError, match="at least one model"):
+        estimate_memory(
+            facts,
+            parameters=8,
+            context_length=8,
+            supervised_share=1.0,
+            gradient_checkpointing=False,
+            optimiser="adafactor",
+            models=0,
+        )
+
+
+def test_the_budget_report_names_the_model_count_when_there_is_more_than_one() -> None:
+    """A reader comparing a preference run to a supervised one needs to see why."""
+    facts = {"hidden": 2560, "layers": 32, "vocab": 248320}
+    report = estimate_memory(
+        facts,
+        parameters=4_330_000_000,
+        context_length=4096,
+        supervised_share=0.32,
+        gradient_checkpointing=True,
+        optimiser="adafactor",
+        models=2,
+    ).report()
+    assert "2 model copies" in report
+
+
 def test_selective_is_the_default_loss_because_it_is_cheaper_and_identical() -> None:
     """Named, not silent: the alternative exists and is a deliberate choice."""
     assert LOSS_MODES == ("selective", "builtin")

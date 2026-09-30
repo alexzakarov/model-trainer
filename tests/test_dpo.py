@@ -113,15 +113,270 @@ def test_the_margin_counts_sign_not_size() -> None:
 
 
 class FixedLogits:
-    """A model that returns logits the test chose."""
+    """A model whose vocabulary logits the test chose.
+
+    Shaped like a real causal LM -- a backbone under ``.model`` and a head under
+    ``.lm_head`` -- because the default path projects the vocabulary itself, and a
+    fake without that split would only ever exercise the fallback. The head returns
+    the same rows the full path would have produced, so both paths can be asserted
+    against each other.
+    """
 
     def __init__(self, logits: Any) -> None:
         """Hold the logits the model should return."""
         self.logits = logits
+        self.model = _FixedBackbone(int(logits.shape[-1]))
+        self.lm_head = _FixedHead(logits)
 
-    def __call__(self, input_ids: Any, attention_mask: Any = None) -> Any:
+    def __call__(self, input_ids: Any, attention_mask: Any = None, **_: Any) -> Any:
         """Return the canned logits, whatever it is asked."""
         return type("Out", (), {"logits": self.logits})()
+
+
+class _FixedBackbone:
+    """Stands in for the transformer stack: hidden states of the right width."""
+
+    def __init__(self, hidden: int) -> None:
+        self.hidden = hidden
+
+    def __call__(self, input_ids: Any = None, **_: Any) -> Any:
+        """Report a hidden state wide enough for the fixed head to consume."""
+        import torch
+
+        length = int(input_ids.shape[1]) if input_ids is not None else 1
+        return type("Out", (), {"last_hidden_state": torch.ones(1, length, self.hidden)})()
+
+
+class _FixedHead:
+    """Stands in for the vocabulary projection, returning the canned logits."""
+
+    def __init__(self, logits: Any) -> None:
+        self.logits = logits
+
+    def __call__(self, hidden: Any) -> Any:
+        """Return one logit row per selected position, taken from the canned tensor."""
+        count = int(hidden.shape[0])
+        return self.logits.reshape(-1, self.logits.shape[-1])[:count]
+
+
+def test_a_run_that_cannot_fit_two_models_is_refused_with_the_reason(
+    tiny_checkpoint: pathlib.Path, qwen_tokenizer: Any, tmp_path: pathlib.Path
+) -> None:
+    """A preference step holds two copies of the weights, and the reader is told.
+
+    The old failure was a raw CUDA OOM with no explanation, after the tokenizer had
+    done its work. The refusal has to name the reason -- two models, and the part of
+    the total that is resident and cannot be traded away -- because a reader who only
+    sees "out of memory" cannot tell a preference run from a supervised one.
+    """
+    lines: list[str] = []
+    with pytest.raises(DatasetError, match="two copies of the weights"):
+        train_dpo(
+            plan(tmp_path / "tight", model_id=str(tiny_checkpoint), memory_budget_gb=0.001),
+            [pair()],
+            qwen_tokenizer,
+            device="cpu",
+            log=lines.append,
+        )
+    assert any("2 model copies" in line for line in lines), (
+        f"the estimate did not say how many models it counted: {lines}"
+    )
+    assert any("budget" in line for line in lines), "the budget was not stated"
+
+
+def test_the_budget_counts_the_reference_model_not_just_the_policy(
+    tiny_checkpoint: pathlib.Path, qwen_tokenizer: Any, tmp_path: pathlib.Path
+) -> None:
+    """One model in the estimate would be an estimate for a different run.
+
+    Weights double; gradients do not, because the reference is frozen. An estimate
+    that got either of those wrong would refuse a run that fits or admit one that
+    does not, and neither shows up until a card is already full.
+    """
+    lines: list[str] = []
+    train_dpo(
+        plan(tmp_path / "counted", model_id=str(tiny_checkpoint)),
+        [pair()],
+        qwen_tokenizer,
+        device="cpu",
+        log=lines.append,
+    )
+    report = "\n".join(lines)
+    weights = float(report.split("weights")[1].split("GB")[0])
+    gradients = float(report.split("gradients")[1].split("GB")[0])
+    assert weights == pytest.approx(gradients * 2, rel=0.05), (
+        f"weights {weights} and gradients {gradients} do not describe two copies of "
+        f"one trainable model; a frozen reference has no gradients"
+    )
+
+
+def test_the_optimiser_is_the_one_the_plan_asked_for(
+    tiny_checkpoint: pathlib.Path,
+    qwen_tokenizer: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AdamW was hardcoded here while the plan recorded a different choice.
+
+    The plan is written to disk as the record of the run, so a recorded "adafactor"
+    that the run ignored is a false record -- and the resident term of the budget
+    understated by 34.6 GB on a 4B model. Asserting the two estimated states differ
+    would not catch a hardcoded optimiser that also happened to move the estimate;
+    watching the factory itself does.
+    """
+    import gotooltrain.dpo as dpo
+
+    # Captured before the patch: calling dpo._build_optimizer inside the replacement
+    # would call the replacement.
+    build = dpo._build_optimizer
+    asked: list[str] = []
+
+    def record(model: Any, chosen: OptimisationPlan) -> Any:
+        asked.append(chosen.optimizer)
+        return build(model, chosen)
+
+    monkeypatch.setattr(dpo, "_build_optimizer", record)
+    for optimiser in ("adafactor", "adamw"):
+        train_dpo(
+            plan(tmp_path / optimiser, model_id=str(tiny_checkpoint), optimizer=optimiser),
+            [pair()],
+            qwen_tokenizer,
+            device="cpu",
+        )
+    assert asked == ["adafactor", "adamw"], (
+        f"the run built its own optimiser instead of the plan's: {asked}"
+    )
+
+
+def test_the_policy_actually_checkpoints_instead_of_pretending_to(
+    tiny_checkpoint: pathlib.Path, qwen_tokenizer: Any, tmp_path: pathlib.Path
+) -> None:
+    """The transformers wrapper checks ``self.training`` before it checkpoints.
+
+    Enabling checkpointing on a model that ``from_pretrained`` returned in eval mode
+    is a silent no-op, which is why this run held every layer's activations. The line
+    in the log has to mean something, so the model is asserted to be in train mode
+    after the run that claims to have enabled it.
+    """
+    lines: list[str] = []
+    train_dpo(
+        plan(
+            tmp_path / "gc",
+            model_id=str(tiny_checkpoint),
+            gradient_checkpointing=True,
+        ),
+        [pair()],
+        qwen_tokenizer,
+        device="cpu",
+        log=lines.append,
+    )
+    assert any("gradient checkpointing on" in line for line in lines)
+
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    from gotooltrain.train import enter_training_mode
+
+    model = AutoModelForCausalLM.from_pretrained(str(tiny_checkpoint), dtype=torch.float32)
+    assert model.training is False, "precondition: from_pretrained returns eval mode"
+    enter_training_mode(model)
+    assert model.training is True
+
+
+def test_the_two_projections_agree_on_value_and_on_gradient(
+    tiny_checkpoint: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The saving is only legitimate if nothing about the objective changed.
+
+    The selective path is worth having because a preference step builds four
+    vocabulary tensors per micro-batch -- policy and reference, chosen and rejected
+    -- at a vocabulary of 248,320. That is only a saving if the numbers come out the
+    same, so both the value and the gradient are compared against the full path on
+    the real architecture. A cheaper graph that trains something else is a different
+    objective wearing a saving's name.
+    """
+    torch = pytest.importorskip("torch")
+
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(str(tiny_checkpoint), dtype=torch.float32)
+    model.train()
+    ids = torch.randint(0, 64, (1, 12))
+    labels = ids.clone()
+    labels[:, :7] = IGNORED_INDEX
+    tensors = {"input_ids": ids, "attention_mask": torch.ones_like(ids), "labels": labels}
+
+    gradients: dict[str, Any] = {}
+    values: dict[str, Any] = {}
+    for mode in ("builtin", "selective"):
+        model.zero_grad(set_to_none=True)
+        out = sequence_logprobs(model, dict(tensors), mode=mode)
+        out.sum().backward()
+        values[mode] = out.detach()
+        gradients[mode] = torch.cat(
+            [p.grad.flatten() for p in model.parameters() if p.grad is not None]
+        )
+
+    assert torch.allclose(values["builtin"], values["selective"], atol=1e-4)
+    scale = max(1.0, float(gradients["builtin"].abs().max()))
+    worst = float((gradients["builtin"] - gradients["selective"]).abs().max())
+    assert worst < 1e-4 * scale, f"gradients differ by {worst} against a scale of {scale}"
+
+
+def test_a_model_without_a_separable_head_is_refused_rather_than_silently_widened() -> None:
+    """Falling back to the full projection would spend the memory this avoids.
+
+    The refusal has to name the alternative, because "selective needs a different
+    checkpoint" is only actionable if the reader is told what to do instead.
+    """
+    torch = pytest.importorskip("torch")
+    logits = torch.zeros(1, 4, 8)
+
+    class NoHead:
+        """A checkpoint with no separable vocabulary head, as some wrappers are."""
+
+        def __call__(self, input_ids: Any, attention_mask: Any = None, **_: Any) -> Any:
+            return type("Out", (), {"logits": logits})()
+
+    with pytest.raises(DatasetError, match="loss_mode='builtin'"):
+        sequence_logprobs(
+            NoHead(),
+            {
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+                "labels": torch.full((1, 4), IGNORED_INDEX),
+            },
+            mode="selective",
+        )
+
+
+def test_a_backbone_that_hides_its_hidden_state_is_refused() -> None:
+    """Without the hidden state the supervised positions cannot be selected.
+
+    The alternative is the full projection this mode exists to avoid, so this is a
+    refusal rather than a fallback.
+    """
+    torch = pytest.importorskip("torch")
+
+    class Opaque:
+        """A wrapper whose backbone returns an object with no hidden state."""
+
+        model = type("Backbone", (), {"__call__": lambda self, **k: type("Out", (), {})()})()
+        lm_head = type("Head", (), {"__call__": lambda self, h: h})()
+
+        def __call__(self, input_ids: Any, attention_mask: Any = None, **_: Any) -> Any:
+            return type("Out", (), {"logits": torch.zeros(1, 4, 8)})()
+
+    with pytest.raises(DatasetError, match="last_hidden_state"):
+        sequence_logprobs(
+            Opaque(),
+            {
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+                "labels": torch.tensor([[0, IGNORED_INDEX, IGNORED_INDEX, IGNORED_INDEX]]),
+            },
+            mode="selective",
+        )
 
 
 def test_only_supervised_positions_contribute() -> None:

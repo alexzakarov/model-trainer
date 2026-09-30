@@ -136,6 +136,7 @@ class MemoryBudget:
     loss: float
     context_length: int
     loss_mode: str
+    models: int = 1
 
     @property
     def resident(self) -> float:
@@ -156,6 +157,7 @@ class MemoryBudget:
         return {
             "context_length": self.context_length,
             "loss_mode": self.loss_mode,
+            "models": self.models,
             "resident_gb": round(self.resident, 2),
             "stored_activations_gb": round(self.stored_activations, 2),
             "transient_activations_gb": round(self.transient_activations, 2),
@@ -165,8 +167,9 @@ class MemoryBudget:
 
     def report(self) -> str:
         """A readable breakdown, so the arithmetic is reviewable by a human."""
+        copies = f", {self.models} model copies" if self.models > 1 else ""
         return (
-            f"memory estimate @ {self.context_length} ctx, {self.loss_mode} loss\n"
+            f"memory estimate @ {self.context_length} ctx, {self.loss_mode} loss{copies}\n"
             f"    weights              {self.weights:7.2f} GB  (resident)\n"
             f"    gradients            {self.gradients:7.2f} GB  (resident)\n"
             f"    optimiser state      {self.optimiser:7.2f} GB  (resident)\n"
@@ -266,6 +269,7 @@ def estimate_memory(
     optimiser: str,
     loss_mode: str = "selective",
     batch_size: int = 1,
+    models: int = 1,
 ) -> MemoryBudget:
     """Estimate a run's peak memory, term by term.
 
@@ -277,9 +281,18 @@ def estimate_memory(
     ``supervised_share`` is the fraction of positions carrying a label. The
     vocabulary term is proportional to it under ``selective`` and to 1.0 under
     ``builtin`` -- that ratio is the whole reason the mode exists.
+
+    ``models`` counts how many copies of the weights are resident. Preference
+    optimisation holds two: the policy being trained and the frozen reference it is
+    compared against. Only the first is trained, so the extra copies are weights
+    alone -- no gradient buffer, no optimiser state, and under ``no_grad`` nothing
+    stored to recompute. Counting gradients per copy would over-refuse a run that
+    fits; counting the reference's activations would refuse one that does not.
     """
+    if models < 1:
+        raise ValueError(f"a run holds at least one model, got {models}")
     parameters_b = parameters / 1e9
-    weights = parameters_b * 2
+    weights = parameters_b * 2 * models
     gradients = parameters_b * 2
     # Adafactor keeps factored row and column statistics, so its state is a few
     # megabytes rather than a copy of the parameters. AdamW keeps two.
@@ -315,6 +328,7 @@ def estimate_memory(
         loss=loss / _GB,
         context_length=context_length,
         loss_mode=loss_mode,
+        models=models,
     )
 
 

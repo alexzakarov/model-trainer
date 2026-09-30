@@ -107,6 +107,11 @@ MEMORY_BUDGET_GB = 40.0
 RESUME_FROM = "auto"   # "auto" = repoda checkpoint varsa devam et | "" = bilerek
                        # sıfırdan | bir repo id ya da revizyon = elle seç
 
+# Tercih optimizasyonu (12-13. hücreler) için her görevin kaç kez deneneceği.
+# 1 OLABİLMEZ: tercih, birinin geçip birinin kaldığı iki denemeden doğar. Tek
+# denemede "başarılı/başarısız" çifti yoktur, `preferences` boş döner.
+N_SAMPLES = 4
+
 EXPANDABLE_SEGMENTS = True               # parçalanmayı azaltır (bkz. 4. hücre)
 EPOCHS = 1
 BATCH_SIZE = 1
@@ -978,6 +983,180 @@ else:
     print("yeniden çalıştırın.")
 """
         ),
+        _code(
+            """
+# @title 12 — DPO hazırlığı: SFT çıktısını sun
+#
+# Tercih optimizasyonu örnek ister, ve örnekler **koşan bir modelden** gelmek
+# zorundadır: aynı görevin birden çok denemesi, biri doğrulanırken biri
+# başarısız olduğunda "tercih" doğar. Tek deneme varsa karşılaştırma yoktur.
+#
+# Bu yüzden 10. hücredeki SFT çıktısını bir OpenAI uyumlu uca sunuyoruz. Kaynak
+# model değil, **eğitilmiş** checkpoint: RESUME_FROM'un tersi. SFT'in yazdığı
+# `runs/colab-sft` klasörü doğrudan kullanılır; ayrıca indirmeye gerek yok.
+#
+# vLLM ayrı bir süreç: GPU'yu bu hücre değil, o süreç tutar. Bu yüzden DPO
+# koşusundan önce kapatılmalı — aynı anda iki model GPU'da olursa bütçe yanlış
+# hesaplanır. `pkill` satırı DPO hücresinde.
+
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+SFT_DIR = pathlib.Path(OUTPUT)
+if not (SFT_DIR / "config.json").is_file():
+    raise SystemExit(
+        f"{SFT_DIR} bir kontrol noktası değil (config.json yok). 10. hücreyi önce "
+        "çalıştır; tercih optimizasyonu SFT'in üstüne kurulur, yanına değil."
+    )
+
+run = sys.executable, "-m", "pip", "install", "-q", "vllm"
+subprocess.run(run, check=True)
+
+VLLM_PORT = 8000
+MODEL_URL = f"http://127.0.0.1:{VLLM_PORT}/v1"
+# gpu_memory_utilization düşük tutuluyor: sunucu kendi ağırlıklarını + KV
+# önbelleğini bu yüzdeyle ayırıyor ve kalanı başka bir şeye ait. 0.85, kartın
+# geri kalanına başka bir iş bırakacak kadar az.
+server = subprocess.Popen(
+    [
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", str(SFT_DIR),
+        "--port", str(VLLM_PORT),
+        "--gpu-memory-utilization", "0.85",
+        "--max-model-len", str(CONTEXT_LENGTH),
+        "--served-model-name", "policy",
+    ],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.STDOUT,
+)
+
+print(f"vLLM başlatıldı (pid {server.pid}), {MODEL_URL} bekleniyor...")
+deadline = time.monotonic() + 900
+while time.monotonic() < deadline:
+    if server.poll() is not None:
+        raise SystemExit(
+            f"vLLM {server.returncode} ile ayrıldı. Yukarıdaki hücre çıktısına bak; "
+            "sunucu başlamadan DPO örnek üretemez."
+        )
+    try:
+        with urllib.request.urlopen(f"{MODEL_URL}/models", timeout=2) as response:
+            print("hazır:", response.read().decode()[:200])
+            break
+    except (urllib.error.URLError, TimeoutError, OSError):
+        time.sleep(5)
+else:
+    server.terminate()
+    raise SystemExit("vLLM 15 dakikada hazır olmadı. Kart dolu olabilir; sunucu öldürüldü.")
+"""
+        ),
+        _code(
+            """
+# @title 13 — Tercih çiftleri, sonra DPO
+#
+# Zincir: **çalıştır -> doğrula -> çift çıkar -> DPO**. Örnek üretimi burada değil,
+# 12. hücredeki sunucudan; burada olan `evalcli queue` -> `judge` -> `preferences`.
+#
+# Önce dürüst olmayı gerektiren bir gerçek var: **görev dosyası bu depoda yok.**
+# Go-UT-Bench `(depo, dosya, kod)` veriyor; değerlendirme ise her görevin kendi
+# `verification` komutunu ve çalışacak bir fixture deposunu bildirmesini istiyor
+# (`src/gotooltrain/tasks.py`). O katman kurulmadan çift üretilemez — çünkü
+# "başarılı" demek, bir testin geçmesi demek.
+#
+# Bu yüzden hücre, dosya yoksa **adıyla durur**. Sıfır çift üretip "başarılı" yapan
+# bir hücre, DPO'nun çalıştığını sandırtır; oysa hiçbir şey karşılaştırılmamıştır.
+# Dosyayı hazırladıktan sonra TASKS_FILE'ı göster, hücreyi yeniden çalıştır.
+
+import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+
+TASKS_FILE = pathlib.Path("data/eval/tasks.jsonl")
+EVAL_STORE = pathlib.Path("runs/eval-store")
+DPO_OUTPUT = "runs/colab-dpo"
+
+if not TASKS_FILE.is_file():
+    print(f"görev dosyası yok: {TASKS_FILE}")
+    print()
+    print("Tercih optimizasyonu için gereken şey:")
+    print("  1) her görevde çalıştırılabilir bir 'verification' komutu")
+    print("  2) çalışacak bir fixture deposu (dosyanın *gerçek* hali)")
+    print("  3) --n-samples > 1: tek deneme karşılaştırma üretmez")
+    print()
+    print("Go-UT-Bench yalnızca (depo, dosya, kod) verir; o katman")
+    print("src/gotooltrain/tasks.py'nin işidir ve docs/EVAL.md'de anlatılır.")
+    raise SystemExit(
+        "Görev dosyası olmadan tercih çifti üretilemez. Bu hata değil, eksik girdi — "
+        "ama DPO'yu 'çalıştı' saymak için sahte bir çift üretmek daha kötü olurdu."
+    )
+
+# DPO iki modeli GPU'da tutar (policy + donmuş referans). vLLM hâlâ ayakta ise
+# bütçe hesabı yanlış olur ve koşu, açıklama yerine ham bir OOM atar.
+subprocess.run(["pkill", "-f", "vllm.entrypoints"], check=False)
+print("vLLM kapatıldı; DPO iki modeli de bu kartta tutacak.")
+
+# --- örnekleri topla -------------------------------------------------------
+common = [
+    "--store", str(EVAL_STORE), "--tasks", str(TASKS_FILE),
+    "--model", "policy", "--revision", f"sft-{CONTEXT_LENGTH}",
+    "--dataset-version", "go-ut-bench-val", "--n-samples", str(N_SAMPLES),
+]
+print(f"\\n1/3 örnekler toplanıyor (her görev {N_SAMPLES} deneme)...")
+subprocess.run(
+    [sys.executable, "-m", "gotooltrain.evalcli", "queue",
+     *common, "--model-url", MODEL_URL,
+     "--sandbox", "local", "--allow-local-execution",
+     "--out", "runs/eval-queue.jsonl"],
+    check=True,
+)
+
+# --- doğrula ---------------------------------------------------------------
+# Colab'da Docker yok, bu yüzden yerel çalıştırma: modelin yazdığı Go bu
+# makinede koşar. Colab atılabilir bir VM olduğu için kabul edilebilir; kendi
+# makinende yapma.
+print("\\n2/3 doğrulama (yazılan Go çalıştırılıyor)...")
+subprocess.run(
+    [sys.executable, "-m", "gotooltrain.evalcli", "judge",
+     *common, "--queue", "runs/eval-queue.jsonl", "--verdicts", "runs/eval-verdicts.jsonl"],
+    check=True,
+)
+
+# --- çiftleri çıkar --------------------------------------------------------
+print("\\n3/3 tercih çiftleri çıkarılıyor...")
+made = subprocess.run(
+    [sys.executable, "-m", "gotooltrain.data", "preferences",
+     *common, "--out", "data/preferences.jsonl", "--report", "runs/preferences-report.json"],
+    check=False,
+)
+if made.returncode != 0:
+    print("Çift çıkmadı. Rapor: runs/preferences-report.json")
+    print("En sık sebep: --n-samples 1. Tek deneme 'başarılı/başarısız' çifti değildir.")
+    raise SystemExit(f"preferences {made.returncode} ile bitti; DPO'ya girmek yanlış olur.")
+
+# --- DPO --------------------------------------------------------------------
+# `--sandbox local` bırakılmadı: DPO çalıştırma kodunu değil, kendi ağırlıklarını
+# kullanır. İki model kopyası olduğu için bellek bütçesi iki modeli sayar; 60 GB
+# adafactor'la 16384'e kadar sığar, adamw 60 GB'a *hiç* sığmaz.
+print("\\nDPO çalışıyor...")
+subprocess.run(
+    [sys.executable, "-u", "-m", "gotooltrain.traincli", "dpo",
+     "--model", str(SFT_DIR), "--output", DPO_OUTPUT,
+     "--tokenizer", str(SFT_DIR), "--pairs", "data/preferences.jsonl",
+     "--dtype", "bfloat16", "--epochs", "1", "--batch-size", "1",
+     "--grad-accum", "4", "--lr", "5e-6", "--max-length", str(CONTEXT_LENGTH),
+     "--memory-budget-gb", str(MEMORY_BUDGET_GB), "--loss-mode", "selective",
+     "--optimizer", "adafactor", "--gradient-checkpointing",
+     "--hub-repo-id", HF_REPO_ID, "--hub-push-every", "10"],
+    check=True,
+)
+"""
+        ),
         _markdown(
             """
 ## Bu koşu ne ölçer, ne ölçmez
@@ -987,10 +1166,16 @@ bloğundan geldi; loss yalnızca asistan token'larına uygulandı; 4B tam FT ger
 bir optimizer adımı attı ve checkpoint yazdı; periyodik yayın takvimi çalıştı.
 
 **Ölçmez:** Go yeteneği. Korpus Go-UT-Bench'in "bu dosya için birim testi yaz"
-görevlerinden gelir — tek turlu, araçsız, sekiz depodan biri ağırlıklı. Bu, korpusun
-katalog öğretmediğini gösteren bir gerçektir, hata değil. Yetenek ölçümü için
-`docs/EVAL.md`'deki üç aşamalı eval gerekir; o konteyner havuzu + `rtk` + gerçek Go
- depoları ister, Colab'da bu yoktur.
+görevlerinden gelir - tek turlu, araçsız, sekiz depodan biri ağırlıklı. Bu, korpusun
+katalog öretmediğini gösteren bir gerçektir, hata değil.
+
+12-13. hücreler bir tercih aşaması sunar, ama **görev dosyası olmadan durur** ve bunu
+söyler. Bunun sebebi yetenek eksikliği değil, girdi eksikliği: tercih çifti ancak
+bir görevin `verification` komutu çalıştırılıp bir deneme geçerken bir başkası
+kalırken doğar. Go-UT-Bench `(depo, dosya, kod)` verir; o katman
+`src/gotooltrain/tasks.py`'nin işidir; mimari karar `docs/EVAL.md`'de. Sıfır çift
+üretip "DPO çalıştı" demek, hiç karşılaştırma yapılmamışken başarı göstermek
+olurdu — o yüzden hücre adıyla durur.
 
 ## Yayınlama hakkında dürüstlük
 

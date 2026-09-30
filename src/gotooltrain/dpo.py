@@ -33,9 +33,14 @@ from .reward import PreferencePair
 from .template import IGNORED_INDEX, SupportsChatTemplate
 from .train import (
     OptimisationPlan,
+    _build_optimizer,
+    _supervised_share,
     _torch_dtype,
     _vision_pad_id,
+    architecture_facts,
     cosine_lr,
+    enter_training_mode,
+    estimate_memory,
     iter_epochs,
     length_grouped_batches,
     steps_for,
@@ -106,7 +111,12 @@ def pair_examples(
     return built[0], built[1]
 
 
-def sequence_logprobs(model: Any, tensors: dict[str, Any]) -> Any:
+def sequence_logprobs(
+    model: Any,
+    tensors: dict[str, Any],
+    *,
+    mode: str = "selective",
+) -> Any:
     """Sum of the log-probabilities of the supervised tokens, per sequence.
 
     ``labels`` carries the ignored index at every position that is not an assistant
@@ -114,23 +124,80 @@ def sequence_logprobs(model: Any, tensors: dict[str, Any]) -> Any:
     would make the number depend on how long the prompt is, and the prompt is
     identical on both sides of a pair -- the difference would then vanish into a
     quantity neither side controls.
+
+    Under ``selective`` the vocabulary head is applied only at those positions, the
+    same trick as :func:`completion_only_loss`, and for the same reason. It matters
+    more here than in SFT: this runs on the policy *and* the reference, for the
+    chosen *and* the rejected side, so a preference step builds four such tensors
+    where a supervised one builds one. The vocabulary is 248,320 wide, so at 4096
+    tokens the unprojected form is 4.07 GB per tensor before the float32 copy that
+    ``log_softmax`` makes.
+
+    Raises rather than falling back: a silent full projection would spend exactly
+    the memory this avoids, and the run would die on an OOM with no explanation.
     """
     import torch
 
-    outputs = model(
+    if mode == "builtin":
+        outputs = model(
+            input_ids=tensors["input_ids"],
+            attention_mask=tensors["attention_mask"],
+        )
+        shifted_logits = outputs.logits[:, :-1, :]
+        shifted_labels = tensors["labels"][:, 1:]
+        # The ignored index is not a vocabulary entry, so it has to be masked out
+        # before the gather -- and then zeroed in the result, or it would count.
+        mask = (shifted_labels != IGNORED_INDEX).to(shifted_logits.dtype)
+        safe_labels = shifted_labels.masked_fill(shifted_labels == IGNORED_INDEX, 0)
+        gathered = _gathered_logprobs(shifted_logits, safe_labels)
+        return (gathered * mask).sum(dim=-1)
+
+    backbone = getattr(model, "model", None)
+    head = getattr(model, "lm_head", None)
+    if backbone is None or head is None:
+        raise DatasetError(
+            "selective loss needs a checkpoint that separates the backbone from the "
+            "vocabulary head (model.model and model.lm_head). This one does not; a "
+            "preference step builds four vocabulary tensors per micro-batch, so the "
+            "full projection is not affordable. Run with loss_mode='builtin' and a "
+            "much smaller context."
+        )
+
+    hidden = backbone(
         input_ids=tensors["input_ids"],
         attention_mask=tensors["attention_mask"],
+        use_cache=False,
     )
-    logits = outputs.logits
-    labels = tensors["labels"]
-    # Causal shift: position i predicts token i+1.
-    shifted_logits = logits[:, :-1, :]
-    shifted_labels = labels[:, 1:]
-    mask = (shifted_labels != IGNORED_INDEX).to(shifted_logits.dtype)
-    safe_labels = shifted_labels.masked_fill(shifted_labels == IGNORED_INDEX, 0)
-    log_probs = torch.log_softmax(shifted_logits, dim=-1)
-    gathered = log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
-    return (gathered * mask).sum(dim=-1)
+    state = getattr(hidden, "last_hidden_state", None)
+    if state is None:
+        raise DatasetError(
+            "the backbone returned no last_hidden_state, so the supervised positions "
+            "cannot be selected before the vocabulary projection. Use loss_mode='builtin'."
+        )
+
+    shifted_hidden = state[:, :-1, :]
+    shifted_labels = tensors["labels"][:, 1:]
+    supervised = shifted_labels != IGNORED_INDEX
+    if not bool(supervised.any()):
+        # A side with nothing supervised sums to nothing, which is the honest
+        # answer and what the full projection returns as well. Refusing here would
+        # be a different contract from the one this function has always had, and the
+        # degenerate pair is caught where the pair is built, not here.
+        return torch.zeros(shifted_labels.shape[0], dtype=state.dtype, device=state.device)
+    # One gather over the selected positions, then scatter the per-position sum back
+    # to a [batch] vector so the caller keeps the shape it had before.
+    per_position = _gathered_logprobs(head(shifted_hidden[supervised]), shifted_labels[supervised])
+    summed = torch.zeros(shifted_labels.shape, dtype=per_position.dtype, device=per_position.device)
+    summed[supervised] = per_position
+    return summed.sum(dim=-1)
+
+
+def _gathered_logprobs(logits: Any, labels: Any) -> Any:
+    """The log-probability of each label under the logits, at the given positions."""
+    import torch
+
+    log_probs = torch.log_softmax(logits, dim=-1)
+    return log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
 
 
 def dpo_loss(
@@ -227,28 +294,54 @@ def train_dpo(
 
     policy = AutoModelForCausalLM.from_pretrained(plan.model_id, dtype=dtype)
     reference = AutoModelForCausalLM.from_pretrained(plan.model_id, dtype=dtype)
+    # The reference stays in eval mode: it is the frozen thing the policy is measured
+    # against, so dropout in it would make the comparison depend on a seed.
     reference.eval()
     for parameter in reference.parameters():
         parameter.requires_grad_(False)
     policy.config.use_cache = False
+
+    examples = [pair_examples(pair, tokenizer, tool_specs=tool_specs) for pair in pairs]
+    rendered = [side for chosen, rejected in examples for side in (chosen, rejected)]
+
+    # Two copies of the weights are resident, and only the policy carries gradients
+    # and optimiser state. Estimated before the first step, because the alternative
+    # is discovering the answer from a CUDA OOM with nothing to look at.
+    budget = estimate_memory(
+        architecture_facts(policy.config),
+        parameters=sum(p.numel() for p in policy.parameters()),
+        context_length=plan.context_length,
+        supervised_share=_supervised_share(rendered),
+        gradient_checkpointing=plan.gradient_checkpointing,
+        optimiser=plan.optimizer,
+        loss_mode=plan.loss_mode,
+        models=2,
+    )
+    emit(budget.report())
+    emit(f"budget: {budget.total:.2f} GB est. / {plan.memory_budget_gb:.2f} GB kart")
+    if not budget.fits(plan.memory_budget_gb):
+        raise DatasetError(
+            f"a preference step needs two copies of the weights: the estimate is "
+            f"{budget.total:.1f} GB against a {plan.memory_budget_gb:.0f} GB budget, and "
+            f"{budget.resident:.1f} GB of that is resident and cannot be traded away. "
+            f"Lower --max-length, or point the run at a card that large."
+        )
+
     if plan.gradient_checkpointing:
-        # Both models run a forward per micro-batch, so activations are held for
-        # the whole stack; recomputing them is what keeps a preference run inside
-        # one card.
+        # `from_pretrained` hands back a model in *eval* mode and the transformers
+        # wrapper checks `self.training` before it will checkpoint anything, so
+        # enabling it on an eval-mode model is a silent no-op. That is what made a
+        # preference run hold every layer's activations: ~101 GB of transient at 4096
+        # tokens, before either model is counted. The reference is left in eval on
+        # purpose; it runs under no_grad, so it stores nothing to recompute.
+        enter_training_mode(policy)
         policy.gradient_checkpointing_enable()
         emit("gradient checkpointing on: activations recomputed per layer")
 
-    examples = [pair_examples(pair, tokenizer, tool_specs=tool_specs) for pair in pairs]
     batches = _pair_batches(examples, plan.per_device_batch_size)
     total_steps = steps_for(len(examples), plan)
     warmup = warmup_steps(total_steps, plan.warmup_ratio)
-    optimizer = torch.optim.AdamW(
-        [p for p in policy.parameters() if p.requires_grad],
-        lr=plan.learning_rate,
-        weight_decay=plan.weight_decay,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-    )
+    optimizer = _build_optimizer(policy, plan)
     from transformers import get_scheduler
 
     scheduler = get_scheduler(
@@ -274,11 +367,13 @@ def train_dpo(
         chosen = _stack([c for c, _ in batch], tokenizer, device=device)
         rejected = _stack([r for _, r in batch], tokenizer, device=device)
         with torch.no_grad():
-            reference_chosen = sequence_logprobs(reference, chosen)
-            reference_rejected = sequence_logprobs(reference, rejected)
+            reference_chosen = sequence_logprobs(reference, chosen, mode=plan.loss_mode)
+            reference_rejected = sequence_logprobs(reference, rejected, mode=plan.loss_mode)
+        # Outside no_grad: the policy's forward has to build a graph, and putting the
+        # objective inside that block silently trains nothing while reporting a loss.
         loss, margin, _accuracy = dpo_loss(
-            sequence_logprobs(policy, chosen),
-            sequence_logprobs(policy, rejected),
+            sequence_logprobs(policy, chosen, mode=plan.loss_mode),
+            sequence_logprobs(policy, rejected, mode=plan.loss_mode),
             reference_chosen,
             reference_rejected,
             beta=beta,

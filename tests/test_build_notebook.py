@@ -59,6 +59,29 @@ def install_cell() -> dict[str, object]:
     raise AssertionError("no cell pulls and installs the repository")
 
 
+def _cell_containing(marker: str) -> dict[str, object]:
+    """The code cell carrying a marker, found by content rather than by position."""
+    for cell in build_cells():
+        if cell["cell_type"] == "code" and marker in sources(cell):
+            return cell
+    raise AssertionError(f"no code cell contains {marker!r}")
+
+
+def serving_cell() -> str:
+    """The cell that serves the trained checkpoint for sampling."""
+    return sources(_cell_containing("vllm.entrypoints"))
+
+
+def dpo_stage_cell() -> str:
+    """The cell that turns samples into pairs and then runs preference optimisation."""
+    return sources(_cell_containing("TASKS_FILE"))
+
+
+def notebook_code() -> str:
+    """Every code cell, joined -- for assertions that span parameters."""
+    return "\n".join(code_cells())
+
+
 # ---------------------------------------------------------------- the document
 
 
@@ -135,7 +158,7 @@ def test_every_code_cell_is_valid_python() -> None:
 
 
 def test_the_cells_run_in_a_usable_order() -> None:
-    """Parameters, hardware, install, Go, token, gate, data, training, verify.
+    """Parameters, hardware, install, Go, token, gate, data, training, verify, dpo.
 
     Checked by the marker each cell carries rather than by index arithmetic, so
     inserting a cell does not silently reorder the run.
@@ -154,6 +177,8 @@ def test_the_cells_run_in_a_usable_order() -> None:
         " 9 — Token formatını doğrula (eğitimden ÖNCE)",
         " 10 — Eğitimi başlat (periyodik Hub yüklemesiyle)",
         " 11 — Ne olduğunu doğrula",
+        " 12 — DPO hazırlığı: SFT çıktısını sun",
+        " 13 — Tercih çiftleri, sonra DPO",
     ]
 
 
@@ -261,6 +286,74 @@ def test_the_go_install_makes_the_toolchain_visible_to_subprocesses() -> None:
     assert 'os.environ["PATH"]' in joined
     assert "export PATH" not in joined
     assert "GOTOOLCHAIN" in joined, "go.mod's toolchain directive must not reach the network"
+
+
+def test_the_preference_stage_refuses_to_pretend_it_ran() -> None:
+    """Zero pairs and a success message is the worst outcome this stage could have.
+
+    A preference needs one sample that passed and one that failed. Without a task
+    file that declares how to decide, the stage cannot produce a pair, and reporting
+    that as "DPO done" would be a lie the reader acts on. It has to name the missing
+    input instead.
+    """
+    stage = dpo_stage_cell()
+    assert "TASKS_FILE" in stage
+    assert "raise SystemExit" in stage, "a missing task file must stop the cell"
+    assert "eksik girdi" in stage, "the refusal says it is a missing input, not a crash"
+    assert "preferences" in stage, "and says which stage would have failed"
+
+
+def test_the_preference_stage_says_that_one_sample_makes_no_pair() -> None:
+    """The most common reason for an empty preference set, stated up front.
+
+    Worth a named parameter and a sentence rather than a discovery: a reader who sets
+    ``--n-samples 1`` gets a refusal that names the number to change.
+    """
+    stage = dpo_stage_cell()
+    assert "N_SAMPLES = 4" in notebook_code()
+    assert "N_SAMPLES" in stage
+    assert "Tek deneme" in stage or "tek deneme" in stage
+
+
+def test_the_serving_cell_waits_for_the_model_it_starts() -> None:
+    """Starting a server is not serving.
+
+    A sample request against a dead port fails with a connection error that reads
+    like a model problem, and the reader's next move would be the wrong one.
+    """
+    serve = serving_cell()
+    assert "vllm.entrypoints.openai.api_server" in serve
+    assert "/models" in serve, "the readiness probe has to hit the real endpoint"
+    assert "server.poll()" in serve, "and notice if the process died instead of waiting"
+    assert "900" in serve, "a bound on the wait, because a silent hang is the failure"
+
+
+def test_the_serving_cell_refuses_to_start_before_the_checkpoint_exists() -> None:
+    """Preference optimisation builds on the supervised run; it does not replace it."""
+    serve = serving_cell()
+    assert "config.json" in serve
+    assert "raise SystemExit" in serve
+
+
+def test_dpo_is_fitted_against_the_same_budget_and_two_models() -> None:
+    """The stage has to pass what it learned: the budget flag and the loss mode.
+
+    Without them the run uses the defaults, which happen to match today, so this
+    test would pass while the notebook and the documented budget drifted apart.
+    """
+    stage = dpo_stage_cell()
+    assert '"--memory-budget-gb", str(MEMORY_BUDGET_GB)' in stage
+    assert '"--loss-mode", "selective"' in stage
+    assert '"--optimizer", "adafactor"' in stage, (
+        "adamw's two parameter-sized moments do not fit the budget with two models"
+    )
+
+
+def test_the_preference_stage_frees_the_gpu_before_dpo_takes_it() -> None:
+    """Two processes holding weights makes the budget an estimate of the wrong thing."""
+    stage = dpo_stage_cell()
+    assert "pkill" in stage
+    assert stage.index("pkill") < stage.index('"dpo"'), "the server goes first"
 
 
 def test_the_expensive_checks_run_before_the_expensive_step() -> None:
