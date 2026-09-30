@@ -462,6 +462,43 @@ def test_the_failure_excerpt_cannot_be_scrolled_away() -> None:
     assert "log_path.read_text" in training, "the excerpt is reprinted, not merely kept"
 
 
+def test_the_context_is_chosen_from_a_measured_budget_not_a_round_number() -> None:
+    """Qwen3.5-4B's activation memory scales with sequence length, not with a constant.
+
+    24 of its 32 layers are Gated DeltaNet with a 1 MB-per-token recurrent state,
+    so 8K tokens is ~196 GB of stored activations and OOMs an 80 GB card. The
+    notebook therefore runs at 4096, where the measured corpus keeps 42% of its
+    records, and says *why* the number is what it is.
+    """
+    parameters = "\n".join(sources(c) for c in build_cells() if c["cell_type"] == "code")
+    assert "CONTEXT_LENGTH = 4096" in parameters
+    assert "1 MB" in parameters, "the budget must be stated, not implied"
+    assert "%42" in parameters or "42%" in parameters, "the surviving share is measured"
+
+
+def test_the_reader_is_told_to_check_that_checkpointing_actually_fired() -> None:
+    """The flag is silent when it is not working.
+
+    It was inert for the entire life of this code -- set, recorded in the plan, and
+    never triggered, because the model was in eval mode. A number in the log is the
+    only way a reader can tell the difference.
+    """
+    joined = "\n".join(code_cells())
+    assert "gradient checkpointing on:" in joined
+    assert "gör" in joined, "the cell must instruct the reader to look for the line"
+
+
+def test_the_allocator_is_told_to_reduce_fragmentation() -> None:
+    """A long metered run accumulates reserved-but-unused blocks.
+
+    This does not fix an over-budget, and the notebook says so; it stops the
+    allocator handing back unusable space in the last hour of a run.
+    """
+    joined = "\n".join(code_cells())
+    assert "expandable_segments:True" in joined
+    assert "PYTORCH_CUDA_ALLOC_CONF" in joined
+
+
 def test_a_dry_run_publishes_nothing() -> None:
     joined = "\n".join(code_cells())
     assert '"--hub-dry-run"' in joined

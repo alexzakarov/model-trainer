@@ -179,6 +179,79 @@ Bölme yolu: değerlendirme WSL'de ya da bir Docker host'unda koşar, veri
 `ResultStore`'a düşer, **checkpoint'ler Colab'da** üretilir. Depolarda değil, iki
 tarafın sözleşmesi budur.
 
+## Bellek: 4B tam fine-tune neden 80 GB'ı dolduruyor
+
+Ölçülmüş değil, hesaplanmış — `Qwen/Qwen3.5-4B` config'i okundu:
+
+| | |
+|---|---|
+| hidden_size / katman | 2560 / 32 |
+| **vocab_size** | **248.320** |
+| katman türleri | 32'nin **24'ü** `linear_attention` (Gated DeltaNet), 8'i `full_attention` |
+| DeltaNet durumu | `[32 v_heads, 128, 128]` = **token başına 1 MB** |
+
+Kalıcı bellek (bf16, Adafactor, batch 1): ağırlık 8,66 GB + gradyan 8,66 GB +
+adafactor ~0,05 GB = **17,4 GB**. Sorun bu değil.
+
+| Bağlam | DeltaNet durumu (checkpointing'siz) | Loss logits (bf16 / fp32) |
+|---|---|---|
+| 2048 | 49 GB | 0,95 / 1,89 GB |
+| 4096 | 98 GB | 1,89 / 3,79 GB |
+| 8192 | **196 GB** | 3,79 / 7,58 GB |
+
+İki terim de bağlamla doğrusal büyüyor; 248 binlik sözlük yüzünden **loss
+terimi** de olağanüstü pahalı. 4B model 80 GB kartta 8K'da OOM vermesi
+beklenen bir şey, sürpriz değil.
+
+## Asıl hata: `--gradient-checkpointing` hiç çalışmıyordu
+
+Transformers'ın sarmalayıcısının koşulu:
+
+    if self.gradient_checkpointing and self.training:
+
+`from_pretrained` modeli **eval modunda** döndürüyor. `train()` hiç
+`model.train()` çağırmadığı için bayrak plana yazılıyor, log'a
+"gradient checkpointing on" diye basılıyor, ve **hiç tetiklenmiyordu**.
+
+Kurulu sarmalayıcıya karşı ölçtüm:
+
+    layer.gradient_checkpointing = True
+    model.training              = False
+    eval() sonrasi   -> checkpointing çağrısı: 0
+    train() sonrasi  -> checkpointing çağrısı: 1
+
+Etkisi: 8K'da ~196 GB yerine ~1,3 GB saklanan aktivasyon. Yani
+`--gradient-checkpointing` bayrağı, belki de projedeki **en pahalı tek satır**
+hataydı — sessiz, plana yazılan ve hiç iş yapmayan.
+
+Düzeltildi: `enter_training_mode(model)` modeli train moduna alır ve kaç
+modülün geçtiğini döndürür, ki log "ne istendi" değil "ne oldu" desin.
+
+## Bağlam 4096'ya indirildi
+
+Bu korpusun gerçek uzunluk dağılımı (ölçüldü, ilk 400 kayıt):
+
+    < 2048 :  46 (%11)     < 4096 : 168 (%42)     < 8192 : 290 (%72)
+    medyan 4848    p90 17669    en uzun 78011
+
+4096 hem sığdırıyor hem korpusun yarısını bırakıyor. Not defteri 8192'de
+denendi ve OOM verdi; 4096 ölçülmüş bütçeye göre seçildi. 8192'yi denemek
+isteyen önce `DRY_RUN=True` ile tek adımı denemeli.
+
+## İki kurulum notu
+
+* **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** ayarlanıyor. Parçalanmayı
+  azaltır; bir bütçe aşımını **çözmez**. Etkisi çalışma zamanında görülür.
+* **Füş DeltaNet çekirdekleri yok.** `flash-linear-attention` ve
+  `causal_conv1d` kurulu değilse transformers referans PyTorch uygulamasına
+  düşüyor ve *"correct but much slower"* diyor — yani doğru ama daha yavaş ve
+  daha bellekli. Bunları kurmak hem hızı hem belleği iyileştirir, ama Colab'daki
+  torch sürümüyle uyumu **doğrulanmamıştır**, bu yüzden deftere sessizce
+  eklenmedi. Denemek istersen 4. hücreden sonra:
+
+      pip install flash-linear-attention causal_conv1d
+
+  kurulum başarısız olursa koşu yine çalışır, yalnızca yavaş olur.
 ## Not defterini yeniden üretmek
 
 Defter elle yazılmaz — elle yazılan bir notebook, incelenemeyen 400 satırlık JSON

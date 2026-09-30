@@ -224,6 +224,21 @@ class RunSummary:
         }
 
 
+def enter_training_mode(model: Any) -> int:
+    """Put the model in training mode; return how many submodules were switched.
+
+    Its own function because it is load-bearing and trivially omissible.
+    ``from_pretrained`` returns a model in eval mode, and the gradient
+    checkpointing wrapper only fires when ``self.training`` is true -- so a run that
+    sets the flag without this line pays full price in activations while the plan
+    claims the memory was saved. The count is returned so the run log can state what
+    actually happened rather than what was requested.
+    """
+    switched = sum(1 for module in model.modules() if not module.training)
+    model.train()
+    return switched
+
+
 def is_multimodal(config: Any) -> bool:
     """Whether a checkpoint carries a vision tower that training must reach.
 
@@ -486,6 +501,7 @@ def train(
     loader = AutoModelForImageTextToText if is_multimodal(model_config) else AutoModelForCausalLM
     emit(f"model class: {loader.__name__} (multimodal checkpoint: {is_multimodal(model_config)})")
     model = loader.from_pretrained(weights, dtype=_torch_dtype(plan.dtype, torch))
+    switched = enter_training_mode(model)
     if not plan.train_vision_tower:
         model, frozen = freeze_vision_tower(model)
         emit(f"vision tower frozen: {frozen} parameters")
@@ -494,7 +510,18 @@ def train(
         # Required for a full fine-tune on a single consumer card: without it the
         # activations for a 32K context are held for every layer at once.
         model.gradient_checkpointing_enable()
-        emit("gradient checkpointing on: activations recomputed per layer")
+        # `from_pretrained` hands back a model in *eval* mode, and the
+        # checkpointing wrapper's condition is `gradient_checkpointing and
+        # self.training`. Entering train mode first is therefore not a formality:
+        # in eval mode the flag is set, recorded in the plan, and never fires.
+        # Measured on Qwen3.5-4B: with 24 of 32 layers being Gated DeltaNet, the
+        # per-token recurrent state is 1 MB, so 8K tokens is ~196 GB of stored
+        # activations without checkpointing against ~1.3 GB with it. Skipping it
+        # is the difference between fitting on an 80 GB card and not.
+        emit(
+            f"gradient checkpointing on: {switched} module(s) recomputed per layer, "
+            f"activations held for one layer at a time"
+        )
 
     collator = collate_fn or (
         lambda batch: collate(

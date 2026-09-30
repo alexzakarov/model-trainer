@@ -54,7 +54,19 @@ def _code(source: str) -> dict[str, Any]:
 #: twice -- the body is full of f-strings, so the whole cell cannot be one template.
 _PARAMETERS_BODY = """
 # Eğitim
-CONTEXT_LENGTH = 8192                  # 32768 tek kartta sığmaz; 8K repo düzeyi iş için yeterli
+#
+# 4096, varsayılan 32768 değil — ölçülmüş bir seçim. Qwen3.5-4B'de 32 katmanın
+# 24'ü Gated DeltaNet (lineer dikkat) ve durum [32 v_heads, 128, 128] yani
+# **token başına 1 MB**. Bu yüzden aktivasyon belleği bağlamla **doğrusal** büyür:
+# 8192 token'da checkpointing olmadan ~196 GB. 80 GB kartta 8192 denendi ve
+# OOM verdi. Aşağıdaki dağılım bu korpusun gerçek uzunlukları (ölçüldü):
+#
+#     < 2048 : %11     < 4096 : %42     < 8192 : %72     medyan 4848
+#
+# 4096 hem sığdırıyor hem korpusun yarısını bırakıyor. 8192'yi denemek istersen
+# önce DRY_RUN=True ile bak: tek adım sığmıyorsa saatler harcanmış olur.
+CONTEXT_LENGTH = 4096
+EXPANDABLE_SEGMENTS = True               # parçalanmayı azaltır (bkz. aşağıdaki hücre)
 EPOCHS = 1
 BATCH_SIZE = 1
 GRAD_ACCUM = 8
@@ -229,6 +241,17 @@ shutil.rmtree(rtk_dir, ignore_errors=True)
 # kurulup sürece aktarılmayan bir Go, kapıdan geçer ve eğitimde patlar.
 os.environ["PATH"] = f"{{root / 'bin'}}:/usr/local/bin:{{os.environ['PATH']}}"
 os.environ["GOTOOLCHAIN"] = "local"
+
+# Parçalanma ayarı. CUDA önbelleğinde ayrılmış ama kullanılmayan bloklar uzun
+# bir koşuda birikir ve "boş" görünen belleği yer. Bu ayar ayrılmış blokları
+# büyüterek birleştirir; etkisi çalışma zamanında görülür, tahmin edilemez.
+if EXPANDABLE_SEGMENTS:
+    _existing = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments" not in _existing:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+            f"{{_existing}},expandable_segments:True" if _existing else "expandable_segments:True"
+        )
+    print("PYTORCH_CUDA_ALLOC_CONF:", os.environ["PYTORCH_CUDA_ALLOC_CONF"])
 
 # `run` 3. hücreden.
 print(run("go", "version"))
@@ -637,6 +660,14 @@ print(tokenizer.decode(example.input_ids[:120], skip_special_tokens=False)[:300]
 #
 # Adafactor: ilk momenti tutmaz, ikinci momenti çarpanlaştırır. Optimizer durumu
 # birkaç GB yerine birkaç MB — tek kartta 4B'yi sığdıran şey bu.
+#
+# **--gradient-checkpointing burada belirleyici.** Bu modelde 32 katmanın 24'ü
+# Gated DeltaNet; duram [32 v_heads, 128, 128] yani token başına 1 MB. Aktivasyon
+# belleği bağlamla doğrusal büyür. Checkpointing olmadan 4096 token ~98 GB, 8192
+# ~196 GB. Etkinleşmesi için modelin *train* modunda olması gerekir
+# (`from_pretrained` eval modunda döndürür) — bu, sürümde artık düzeltildi.
+# Çalışma çıktısında "gradient checkpointing on: N module(s)" satırını **gör**;
+# yoksa bayrak hiç çalışmamış demektir.
 #
 # --hub-push-every: optimizer ADIMI sayar, batch değil. 8 kademe biriktirmeli
 # olduğu için "her batch'te gönder" demek accumulation ayarına bağımlı olurdu.

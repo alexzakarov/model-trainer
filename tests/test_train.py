@@ -35,6 +35,7 @@ from gotooltrain.train import (
     assert_examples_fit,
     assert_token_format,
     cosine_lr,
+    enter_training_mode,
     freeze_vision_tower,
     is_multimodal,
     iter_epochs,
@@ -438,6 +439,64 @@ def test_freezing_the_tower_reports_how_many_parameters() -> None:
     model = FakeModel(["visual.patch.weight", "model.layers.0.weight", "vision_gate"])
     _, frozen = freeze_vision_tower(model)
     assert frozen == 20, "two of the three parameters stopped training"
+
+
+# ------------------------------------------------------------- training mode
+
+
+class ModeTrackingModel:
+    """A model that records the call the loader's eval mode would have missed."""
+
+    def __init__(self) -> None:
+        """Start in eval mode, the way ``from_pretrained`` leaves a model."""
+        self.training = False
+
+    def modules(self) -> Any:
+        """Yield itself as the only submodule, so the count is one."""
+        yield self
+
+    def train(self, mode: bool = True) -> None:
+        """Record the switch, as ``nn.Module.train`` would perform it."""
+        self.training = mode
+
+
+def test_a_loaded_model_is_put_into_training_mode() -> None:
+    """The flag that saves the memory only fires in training mode.
+
+    ``from_pretrained`` returns a model in eval mode, and the checkpointing wrapper
+    checks ``self.training``. Measured against the real wrapper: with the flag set
+    and the model in eval mode, the checkpointing function is called *zero* times;
+    after ``train()``, once. So a run that sets ``--gradient-checkpointing`` without
+    this line pays full activation cost while its plan claims otherwise.
+    """
+    model = ModeTrackingModel()
+    assert model.training is False
+    switched = enter_training_mode(model)
+    assert model.training is True
+    assert switched == 1, "the count is reported so the log states what happened"
+
+
+def test_entering_training_mode_reports_what_it_switched() -> None:
+    """The count is the whole point: it is what the run log prints.
+
+    ``nn.Module.modules()`` yields submodules, not parameters, so a two-Linear
+    stack is three modules and reports three.
+    """
+    torch = pytest.importorskip("torch")
+    module = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    module.eval()
+    assert enter_training_mode(module) == 3
+    assert module.training is True
+    assert all(child.training for child in module)
+
+
+def test_a_second_entry_reports_nothing_left_to_switch() -> None:
+    """Idempotent, so a resumed run is never told it saved memory a second time."""
+    torch = pytest.importorskip("torch")
+    module = torch.nn.Linear(2, 2)
+    module.eval()
+    enter_training_mode(module)
+    assert enter_training_mode(module) == 0
 
 
 # -------------------------------------------------------------------- summary
