@@ -305,19 +305,26 @@ shutil.rmtree(rtk_dir, ignore_errors=True)
 os.environ["PATH"] = f"{{root / 'bin'}}:/usr/local/bin:{{os.environ['PATH']}}"
 os.environ["GOTOOLCHAIN"] = "local"
 
-# ---------------------------------------------------------------- rtk kurulumu
+# rtk kurulumu, ve başlatılması
 #
 # rtk kurulu ama başlatılmamışsa her komuta "[rtk] /!\\ No hook installed" uyarısı
 # basar. Bu, **paketin kendi testlerinden birini kırar**: başarılı bir `go build`
-# sessiz olmalı ve uyarı yazıyor. Yani kurulum eksik değil eksiksiz sayılıyordu ve
-# kalite kapısı Colab'da da düşüyordu — hata modelden değil, iki satır eksik
-# kurulumdan geliyordu. Sandbox imajı bunu yapıyor, o yüzden orada görünmüyor.
+# sessiz olmalı. Yani kurulum eksik değil eksiksiz sayılıyordu ve kalite kapısı
+# Colab'da düşüyordu — hata modelden değil, iki satır eksik kurulumdan geliyordu.
+# Sandbox imajı bunu yapıyor, o yüzden orada görünmüyor.
+#
+# Dönüş kodu tek başına teşhis değil: rtk ne yazdıysa basılıyor.
 _initialised = subprocess.run(
     ["rtk", "init", "-g"], capture_output=True, text=True, check=False
 )
 print("rtk init -g:", _initialised.returncode)
-if _initialised.stdout.strip():
-    print(" ", _initialised.stdout.strip()[:400])
+# Dönüş kodu tek başına teşhis değil. rtk ne yazdıysa basılıyor: sıfırdan farklı bir
+# kod, "başarısız" demekten daha az bilgi veriyor, ve bu hücre kurulumun tek yerinde
+# olduğu yer. Süslü parantez kullanılmıyor çünkü bu hücre bir f-string şablonu:
+# yazılırsa derleme zamanında açılır ve hücre NameError ile ölür.
+for _name, _value in (("stdout", _initialised.stdout), ("stderr", _initialised.stderr)):
+    if _value.strip():
+        print("  " + _name + ": " + _value.strip()[:400])
 
 # Parçalanma ayarı. CUDA önbelleğinde ayrılmış ama kullanılmayan bloklar uzun
 # bir koşuda birikir ve "boş" görünen belleği yer. Bu ayar ayrılmış blokları

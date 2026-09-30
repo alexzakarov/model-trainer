@@ -354,7 +354,7 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                 (
                     "python",
                     "-m",
-                    "gotooltrain.data",
+                    "gotooltrain.datacli",
                     "go-pairs",
                     "--source",
                     str(options.source_split),
@@ -472,7 +472,7 @@ def build_stages(options: argparse.Namespace) -> list[Stage]:
                 (
                     "python",
                     "-m",
-                    "gotooltrain.data",
+                    "gotooltrain.datacli",
                     "preferences",
                     "--store",
                     options.store,

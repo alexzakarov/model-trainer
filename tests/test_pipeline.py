@@ -310,6 +310,75 @@ def test_a_dry_run_prints_the_plan_and_runs_nothing(tmp_path: pathlib.Path, caps
     assert "[dry]" in out, f"the stages were not marked as rehearsals: {out}"
 
 
+def test_every_module_the_pipeline_names_actually_exists(tmp_path: pathlib.Path) -> None:
+    """A stage that names a module that is not installed fails after the gate passes.
+
+    This is not hypothetical: the corpus stage named ``gotooltrain.data`` while the
+    module is ``gotooltrain.datacli``. Every other test here asserted on the command
+    *strings*, and a string can be perfectly well formed and still name nothing. The
+    gate ran, passed, and the run then stopped two stages in with
+    "No module named gotooltrain.data" -- the reader's first thought would have been
+    that the install was broken.
+    """
+    import importlib
+
+    for stage in pipe.build_stages(options(tmp_path)):
+        for index, token in enumerate(stage.command):
+            if token == "-m":
+                name = stage.command[index + 1]
+                assert importlib.util.find_spec(name) is not None, (
+                    f"stage {stage.name} runs `python -m {name}` and that module does not exist"
+                )
+
+
+def test_every_flag_the_pipeline_passes_is_one_the_cli_defines(tmp_path: pathlib.Path) -> None:
+    """A flag the CLI does not define aborts argparse with exit code 2.
+
+    Checked against each CLI's own help text, so it is the real surface the pipeline
+    depends on rather than a private helper. The alternative -- finding out by
+    watching a multi-hour run stop at the last stage -- is not a test. A stage's
+    non-flag arguments are skipped: they are paths and numbers, not switches.
+    """
+    import subprocess
+
+    def help_for(command: tuple[str, ...]) -> str:
+        """The help of the sub-command this stage actually invokes.
+
+        Flags live on the sub-command, not on the top-level parser: ``--help`` at the
+        top lists only the sub-commands, which is how a stage can pass a switch that
+        does not exist and still look fine to a reader.
+        """
+        index = command.index("-m")
+        name = command[index + 1]
+        rest = command[index + 2 :]
+        subcommand = rest[0] if rest and not rest[0].startswith("-") else None
+        argv = [sys.executable, "-m", name] + ([subcommand] if subcommand else []) + ["--help"]
+        # The module and sub-command come from this module's own stage table, never from a
+        # dataset or a downloaded file.
+        result = subprocess.run(  # noqa: S603 - argv built from the stage table above
+            argv, capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 0, f"{' '.join(argv[2:])} failed: {result.stderr[:300]}"
+        return result.stdout + result.stderr
+
+    stages = pipe.build_stages(options(tmp_path))
+    for stage in stages:
+        index = stage.command.index("-m")
+        module_name = stage.command[index + 1]
+        rest = stage.command[index + 2 :]
+        subcommand = rest[0] if rest and not rest[0].startswith("-") else ""
+        for position, token in enumerate(rest):
+            if not token.startswith("--"):
+                continue
+            nxt = rest[position + 1] if position + 1 < len(rest) else ""
+            if nxt and not nxt.startswith("-"):
+                continue  # the token after this one is its value, not another switch
+            assert token in help_for(stage.command), (
+                f"stage {stage.name} passes {token}, which "
+                f"`{module_name} {subcommand}`.strip() does not define"
+            )
+
+
 def test_a_failed_stage_is_recorded_where_a_caller_can_name_it(tmp_path: pathlib.Path) -> None:
     """The reader should not have to scroll back through thousands of lines.
 
