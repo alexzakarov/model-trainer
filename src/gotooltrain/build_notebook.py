@@ -597,8 +597,14 @@ print(tokenizer.decode(example.input_ids[:120], skip_special_tokens=False)[:300]
 #
 # --hub-push-every: optimizer ADIMI sayar, batch değil. 8 kademe biriktirmeli
 # olduğu için "her batch'te gönder" demek accumulation ayarına bağımlı olurdu.
+#
+# İlk koşuda DRY_RUN=True ile başla: pahalı hücrelerden geçer, takvimi ve
+# dosyer yazımını prova eder, tek bir bayt göndermez. Yeşil görünce DRY_RUN=False
+# yapıp yeniden çalıştır.
 
 import subprocess
+
+OUTPUT = "runs/colab-sft"
 
 with open("data/sft.jsonl", "w", encoding="utf-8", newline="\\n") as handle:
     for row in rendered:
@@ -608,7 +614,7 @@ print(f"data/sft.jsonl yazıldı: {len(rendered)} kayıt")
 command = [
     sys.executable, "-m", "gotooltrain.traincli", "sft",
     "--model", MODEL_ID,
-    "--output", "runs/colab-sft",
+    "--output", OUTPUT,
     "--tokenizer", MODEL_ID,
     "--dataset", "data/sft.jsonl",
     "--dtype", "bfloat16",
@@ -632,6 +638,28 @@ print("böylece sekme kapanırsa kaybedilen şey en fazla PUSH_EVERY adım olur.
 print()
 result = subprocess.run(command, check=False)
 print("exit:", result.returncode)
+
+# Çıkış kodu **kontrol edilir**. Yoksa başarısız bir koşu sessizce geçer ve hata
+# iki hücre sonra, tamamen alakasız bir yerde ("hub_push.json yok") belirir —
+# yani asıl sebebi değil, sonucunu gördüğümüzü sandığımız hatayı okuruz.
+if result.returncode != 0:
+    out = pathlib.Path(OUTPUT)
+    listing = sorted(p.name for p in out.iterdir()) if out.is_dir() else []
+    started = "training_plan.json" in listing
+    published = "hub_push.json" in listing
+    print(f"\\n{OUTPUT} içinde: {listing}")
+    if not listing:
+        cause = "Koşu modeli yükleyemeden durdu; çıktı dizini bile oluşmadı."
+    elif not started:
+        cause = "Koşu başlamadan durdu."
+    elif not published:
+        cause = "Koşu başladı ama bitmedi; yayınlama adımına hiç gelinmedi."
+    else:
+        cause = "Koşu yayınladı ama hata ile bitti."
+    raise SystemExit(
+        f"Eğitim {{result.returncode}} ile bitti. Yukarıdaki çıktıya bakın.\\n{{cause}}\\n"
+        "Bu hücre hatayı yutmaz: 11. hücreye geçmeden durur."
+    )
 """
         ),
         _code(
@@ -640,17 +668,42 @@ print("exit:", result.returncode)
 #
 # "Push ettim" demek yetmez; push'un *ne* olduğu okunmalı. Yayınlanan klasör
 # kendi kökenini taşır: hangi adım, hangi ayarlar.
+#
+# Ama önce ayrım: çıktı dizini hiç oluşmadı mı, yoksa koştu ve yayınlama adımına
+# mı gelmedi? Bu ikisi farklı hatalar ve aynı hata mesajıyla gelmez. "hub_push.json
+# yok" demek, asıl hatayı değil *sonucunu* söyler; 10. hücre artık yutmuyor ama
+# yine de teşhis burada kesinleşmeli.
 
 import json
+import pathlib
 
 from gotooltrain import read_push_state
 
-state = read_push_state("runs/colab-sft")
+output_dir = pathlib.Path(OUTPUT)
+if not output_dir.is_dir():
+    raise SystemExit(
+        f"{output_dir} yok — eğitim hiç çıktı üretmedi, yani model yüklenmeden ya da "
+        "planı yazmadan durdu. 10. hücrenin çıktısına bakın."
+    )
+
+listing = sorted(p.name for p in output_dir.iterdir())
+print(f"{output_dir} içinde: {listing}")
+print()
+
+state = read_push_state(output_dir)
 print(f"step {state['step']}/{state['total_steps']}")
 plan_record = state["plan"]
-for key in ("model_id", "learning_rate", "epochs", "context_length", "optimizer", "token_format"):
-    print(f"  {key:18} {plan_record[key]}")
-print(f"  {'hub':18} {plan_record['hub']}")
+for key in (
+    "model_id",
+    "learning_rate",
+    "epochs",
+    "context_length",
+    "optimizer",
+    "token_format",
+    "gradient_checkpointing",
+):
+    print(f"  {key:22} {plan_record[key]}")
+print(f"  {'hub':22} {plan_record['hub']}")
 
 if not DRY_RUN:
     from huggingface_hub import HfApi
@@ -661,6 +714,10 @@ if not DRY_RUN:
     for name in sorted(files)[:15]:
         print("  ", name)
     print("\\ngit log gibi: her push bir commit. Adım commit mesajında.")
+else:
+    print("\\nDRY_RUN=True idi: hiçbir şey gönderilmedi. Yukarıdaki 'pushed step'")
+    print("satırlarını 10. hücrede görmüş olmalısınız. Şimdi DRY_RUN=False yapıp")
+    print("yeniden çalıştırın.")
 """
         ),
         _markdown(

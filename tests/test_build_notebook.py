@@ -312,6 +312,62 @@ def test_a_stray_install_elsewhere_on_the_path_is_refused() -> None:
     assert "startswith(target)" in joined
 
 
+def test_the_training_cell_refuses_to_swallow_a_failure() -> None:
+    """A non-zero exit stops the notebook where the error is.
+
+    The measured failure this prevents: training died, the cell printed
+    ``exit: 1`` and carried on, and the next cell then complained about a missing
+    ``hub_push.json`` -- which is a *consequence* of the failure, not its cause. Two
+    cells of misdirection, discovered on a metered machine.
+    """
+    joined = "\n".join(code_cells())
+    training = joined.index("gotooltrain.traincli")
+    check = joined.index("if result.returncode != 0:", training)
+    assert training < check
+    verify = joined.index("@title 11", training)
+    assert check < verify, "the failure is raised before the verification cell runs"
+
+
+def test_the_training_cell_names_which_stage_the_run_reached() -> None:
+    """Four different outcomes, four different messages.
+
+    An empty output directory, a run that started and never finished, a run that
+    finished without publishing, and a run that published -- collapsing these into
+    "hub_push.json yok" throws away the only information that says where to look.
+    """
+    joined = "\n".join(code_cells())
+    training = joined[joined.index("@title 10") : joined.index("@title 11")]
+    assert "training_plan.json" in training, "started-but-unfinished is a different failure"
+    assert "hub_push.json" in training, "finished-but-unpublished is a different failure"
+    assert "çıktı dizini bile oluşmadı" in training
+
+
+def test_the_verification_cell_checks_before_it_reads() -> None:
+    """It reads a file the run is supposed to have written, so it looks first.
+
+    A bare ``read_push_state`` on a missing path reports a data error; here the
+    output directory is checked and its contents listed first, so the reader is
+    told what exists rather than only what does not.
+    """
+    joined = "\n".join(code_cells())
+    verify = joined[joined.index("@title 11") :]
+    assert "is_dir()" in verify, "an absent output directory is a different failure"
+    assert "eğitim hiç çıktı üretmedi" in verify
+    listing = verify.index("iterdir()")
+    reading = verify.index("read_push_state(output_dir)")
+    assert listing < reading, "the directory is listed before it is read"
+
+
+def test_the_notebook_tells_the_reader_to_rehearse_before_it_costs_money() -> None:
+    """A metered run is not the place to discover that publication is misconfigured.
+
+    The dry run exercises the schedule, the folder writing and the bookkeeping, and
+    sends nothing -- so the first real run is the second run.
+    """
+    joined = "\n".join(code_cells())
+    assert "DRY_RUN=True ile başla" in joined
+
+
 def test_a_dry_run_publishes_nothing() -> None:
     joined = "\n".join(code_cells())
     assert '"--hub-dry-run"' in joined
