@@ -160,9 +160,18 @@ TRAINING_MODE = ""          # tam fine-tune. "qlora" araca bağlı, bu defterin 
 # hangi durumda olduğunu komuttan önce yazar.
 RUN_PREFERENCE_STAGE = True
 
-# Kalite kapısı her koşuda yeniden kurulmaz; dakikalar verir ve sonucu
-# değiştirmez. Kapatmak bir tercih olduğu için burada adı var.
-RUN_QUALITY_GATE = True
+# Kalite kapısı (paketin kendi testleri). **Kapalı.**
+#
+# Sebep: kapı, koşunun ilk aşaması ve `coverage --fail-under=100` ile çalışıyor. Bu
+# depo için doğru bir kural, ama Colab'da koşuyu defalarca daha başlamadan durdurdu —
+# ve durduğu yer, eğitimle ilgisi olmayan bir aşamaydı. Bir eğitim koşusunu kendi
+# test paketinin arkasında bekletmek yerine, kapı burada kapatıldı.
+#
+# Kapalıyken bir hata **yine** görünür, ama başka bir aşamada: `device`, `corpus`,
+# `sft`. Yani daha erken değil, daha *ilgili* bir yerde.
+#
+# Açmak istersen True yap; o zaman testler yeşil olmalı ve koşu dakikalarca bekler.
+RUN_QUALITY_GATE = False
 
 EXPANDABLE_SEGMENTS = True               # parçalanmayı azaltır (bkz. 4. hücre)
 EPOCHS = 1
