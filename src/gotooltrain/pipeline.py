@@ -26,6 +26,7 @@ cannot poison anything.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import pathlib
@@ -1247,6 +1248,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     # notebook reported a stage that does not exist in the plan, and the real error was
     # only in the scrollback above.
     log_root = pathlib.Path(options.log_root)
+    # Cleared before anything can fail, not inside `run()`. A run that fails before the
+    # first stage never reaches `run()`, so the previous record survived and was reported
+    # as this run's -- with the previous run's exit code, which is how the notebook came
+    # to print one number while the record held another.
+    log_root.mkdir(parents=True, exist_ok=True)
+    stale = log_root / "last_failure.json"
+    with contextlib.suppress(OSError):
+        stale.unlink()
     try:
         # `auto` is resolved here, in code that is tested, rather than in the notebook
         # cell that used to hold it. Every caller gets the same decision.
@@ -1265,15 +1274,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         stages = build_stages(options)
-    except DatasetError as exc:
-        # Recorded as a refusal before the chain started, so the caller reports this run
-        # rather than a previous one.
-        log_root.mkdir(parents=True, exist_ok=True)
-        (log_root / "last_failure.json").write_text(
-            json.dumps({"stage": "(before the first stage)", "exit_code": 2}, indent=2),
+    except Exception as exc:  # a CLI entry point reports, it does not crash
+        # Anything that fails here runs outside the machinery that records stage
+        # failures, so without this it is a bare traceback with no record naming what
+        # went wrong. Measured: a Hub lookup raised, the notebook reported a stage left
+        # over from a previous run, and the real reason was only in the scrollback.
+        #
+        # The reason goes *into the record*, not only to the screen: the caller reads the
+        # record, and a reason that lives only in output the reader has to scroll back
+        # through is a reason that gets lost.
+        reason = f"{type(exc).__name__}: {exc}"
+        log_root.joinpath("last_failure.json").write_text(
+            json.dumps(
+                {"stage": "(before the first stage)", "exit_code": 2, "reason": reason},
+                indent=2,
+            ),
             encoding="utf-8",
         )
-        print(f"\nPIPELINE STOPPED before the first stage: {exc}")
+        print(f"\nPIPELINE STOPPED before the first stage: {reason}")
         raise SystemExit(2) from exc
     if not stages:
         print("no stages selected; nothing to do")

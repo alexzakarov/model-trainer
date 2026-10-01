@@ -733,8 +733,14 @@ if result.returncode:
     if failure.is_file():
         info = json.loads(failure.read_text(encoding="utf-8"))
         stage = info["stage"]
-        log = pathlib.Path("runs/pipeline") / f"{stage}.log"
         print(f"\\nDURAN ASAMA: {stage} (cikis kodu {info['exit_code']})")
+        # Sebep kaydin *icinde* varsa burada basilir. Yukaridaki ciktiya guvenmek
+        # yetmiyor: okunan sey bu kayit ve kaydirilan bir ciktinin icinde kalan sebep,
+        # kaybolan sebeptir. Olculdu — bir onceki turda kullanicidan traceback'i elle
+        # istemek zorunda kaldim.
+        if info.get("reason"):
+            print(f"  sebep: {info['reason']}")
+        log = pathlib.Path("runs/pipeline") / f"{stage}.log"
         print(f"log: {log}")
         # Log yoksa **çökmüyoruz**. Ölçüldü: in-process aşamalar önce log yazmıyordu ve
         # bu satır FileNotFoundError verince asıl hata görünmez oldu — hatayı bildiren

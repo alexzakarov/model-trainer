@@ -297,6 +297,18 @@ def test_the_run_cell_does_not_swallow_a_failure() -> None:
     assert "returncode" in cell
 
 
+def test_the_failure_report_prints_the_reason_stored_with_it() -> None:
+    """The record carries the reason, so the reader does not have to scroll back.
+
+    Measured: a failure before the first stage had no stage log by construction, the
+    reason lived only in output above the report, and the only way to get it was to ask
+    someone to copy it out of a notebook cell.
+    """
+    cell = run_cell()
+    assert 'info.get("reason")' in cell
+    assert "sebep:" in cell
+
+
 def test_the_failure_report_does_not_crash_on_a_missing_log() -> None:
     """The code that reports a failure must not become one.
 

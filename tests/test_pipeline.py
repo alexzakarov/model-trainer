@@ -990,13 +990,45 @@ def test_a_failure_before_the_first_stage_is_named_rather_than_left_as_a_traceba
 
     monkeypatch.setattr(pipe, "resolve_resume", broken)
     logs = tmp_path / "logs"
+    logs.mkdir()
+    # A record left by an earlier run. The pre-stage path never reaches `Pipeline.run`,
+    # which is where the record used to be cleared, so this one would have been reported
+    # as this run's -- with the earlier run's exit code, which is exactly how the
+    # notebook came to print one number while the record held another.
+    (logs / "last_failure.json").write_text(
+        json.dumps({"stage": "an-older-stage", "exit_code": 9}), encoding="utf-8"
+    )
+
     with pytest.raises(SystemExit) as raised:
         pipe.main(["--log-root", str(logs), "--extra-sft", "--resume-from", "auto"])
     assert raised.value.code == 2
 
     record = json.loads((logs / "last_failure.json").read_text(encoding="utf-8"))
-    assert record["stage"] == "(before the first stage)"
+    assert record["stage"] == "(before the first stage)", "the older record was reported"
+    assert record["exit_code"] == 2, "the older record's exit code was reported"
+    # The reason is in the record, not only in output the reader has to scroll back to.
+    assert "the Hub could not be read" in record["reason"]
     assert "the Hub could not be read" in capsys.readouterr().out, "the reason was not shown"
+
+
+def test_an_unexpected_error_before_the_first_stage_is_reported_not_raised(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A crash here is a bare traceback with no record.
+
+    The caller then reports whatever the previous run left behind. The exception type is
+    named so a reader can tell an expected refusal from a bug in the pipeline itself.
+    """
+    monkeypatch.setattr(
+        pipe, "build_stages", lambda options: (_ for _ in ()).throw(KeyError("worker"))
+    )
+    logs = tmp_path / "logs"
+    with pytest.raises(SystemExit) as raised:
+        pipe.main(["--log-root", str(logs)])
+    assert raised.value.code == 2
+    record = json.loads((logs / "last_failure.json").read_text(encoding="utf-8"))
+    assert "KeyError" in record["reason"], record
+    assert "KeyError" in capsys.readouterr().out
 
 
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:
