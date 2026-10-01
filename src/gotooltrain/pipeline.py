@@ -105,6 +105,17 @@ class Pipeline:
     def run(self, *, dry_run: bool = False) -> int:
         """Run every stage in order; return the first fatal failure's exit code."""
         self.log_root.mkdir(parents=True, exist_ok=True)
+        # A failure record from a previous run is not a record of this one. Measured:
+        # the test suite ran a pipeline that wrote one into this directory, a later run
+        # failed for an unrelated reason, and the caller reported the *old* stage -- so
+        # the notebook said the run stopped at a stage that does not exist. Clearing it
+        # is what makes the file mean "this run" rather than "some run".
+        stale = self.log_root / "last_failure.json"
+        if stale.is_file():
+            try:
+                stale.unlink()
+            except OSError:  # pragma: no cover - an unwritable directory is reported elsewhere
+                self.emit(f"(could not clear the previous failure record at {stale})")
         for stage in self.stages:
             if dry_run:
                 self.emit(f"[dry] {stage.name}: {' '.join(str(part) for part in stage.command)}")
@@ -1229,29 +1240,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         values["revision"] = f"sft-{values['context_length']}"
     options = argparse.Namespace(**values)
 
-    # `auto` is resolved here, in code that is tested, rather than in the
-    # notebook cell that used to hold it. Every caller gets the same decision.
-    options.extra_sft = resolve_resume(options.extra_sft, repo_id=options.hub_repo)
-    options.extra_dpo = resolve_resume(options.extra_dpo, repo_id=options.hub_repo)
+    # Anything that fails before the first stage runs outside the machinery that records
+    # failures, so it surfaces as a bare traceback with no record naming what went wrong
+    # -- and the caller, reading the last record, reports whatever the *previous* run
+    # left behind. Measured: a Hub lookup for `--resume-from auto` raised here, the
+    # notebook reported a stage that does not exist in the plan, and the real error was
+    # only in the scrollback above.
+    log_root = pathlib.Path(options.log_root)
+    try:
+        # `auto` is resolved here, in code that is tested, rather than in the notebook
+        # cell that used to hold it. Every caller gets the same decision.
+        options.extra_sft = resolve_resume(options.extra_sft, repo_id=options.hub_repo)
+        options.extra_dpo = resolve_resume(options.extra_dpo, repo_id=options.hub_repo)
 
-    if args.command == "prepare-data":
-        # Its own entry point so the corpus can be re-measured without re-running the
-        # gate and the download. The measurement is cheap; the pipeline is not.
-        prepare_data(
-            options.corpus,
-            options.dataset,
-            max_records=options.max_records,
-            max_tokens_per_record=options.max_tokens_per_record,
-            tokenizer_name=options.model,
+        if args.command == "prepare-data":
+            # Its own entry point so the corpus can be re-measured without re-running the
+            # gate and the download. The measurement is cheap; the pipeline is not.
+            prepare_data(
+                options.corpus,
+                options.dataset,
+                max_records=options.max_records,
+                max_tokens_per_record=options.max_tokens_per_record,
+                tokenizer_name=options.model,
+            )
+            return 0
+        stages = build_stages(options)
+    except DatasetError as exc:
+        # Recorded as a refusal before the chain started, so the caller reports this run
+        # rather than a previous one.
+        log_root.mkdir(parents=True, exist_ok=True)
+        (log_root / "last_failure.json").write_text(
+            json.dumps({"stage": "(before the first stage)", "exit_code": 2}, indent=2),
+            encoding="utf-8",
         )
-        return 0
-
-    stages = build_stages(options)
+        print(f"\nPIPELINE STOPPED before the first stage: {exc}")
+        raise SystemExit(2) from exc
     if not stages:
         print("no stages selected; nothing to do")
         return 0
 
-    pipeline = Pipeline(stages)
+    pipeline = Pipeline(stages, log_root=pathlib.Path(options.log_root))
     pipeline.announce()
     code = pipeline.run(dry_run=args.dry_run)
     print(pipeline.summary())

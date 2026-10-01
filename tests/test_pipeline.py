@@ -974,6 +974,31 @@ def test_an_in_process_stage_leaves_a_log_like_every_other_stage(
     assert pipeline.results[0].log == log
 
 
+def test_a_failure_before_the_first_stage_is_named_rather_than_left_as_a_traceback(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--resume-from auto` asks the Hub before any stage runs.
+
+    That call is outside the machinery that records stage failures, so when it raised the
+    process died with a bare traceback and no record of where -- and the caller, reading
+    the last record, reported whatever a previous run had left there. Measured: the
+    notebook named a stage that does not exist in the plan.
+    """
+
+    def broken(extra: Any, *, repo_id: str, fetch: Any = None) -> Any:
+        raise DatasetError("the Hub could not be read")
+
+    monkeypatch.setattr(pipe, "resolve_resume", broken)
+    logs = tmp_path / "logs"
+    with pytest.raises(SystemExit) as raised:
+        pipe.main(["--log-root", str(logs), "--extra-sft", "--resume-from", "auto"])
+    assert raised.value.code == 2
+
+    record = json.loads((logs / "last_failure.json").read_text(encoding="utf-8"))
+    assert record["stage"] == "(before the first stage)"
+    assert "the Hub could not be read" in capsys.readouterr().out, "the reason was not shown"
+
+
 def test_the_stages_are_in_the_order_the_run_has_to_happen_in(tmp_path: pathlib.Path) -> None:
     """Each stage consumes what the one before it produced.
 
@@ -1124,7 +1149,10 @@ def test_the_corpus_can_be_re_measured_without_re_running_the_chain(
     """
     empty = tmp_path / "empty.jsonl"
     empty.write_text("", encoding="utf-8")
-    with pytest.raises(DatasetError, match="No data to train on"):
+    # A refusal, reported the same way as one from a stage: the entry point is outside
+    # the machinery that records stage failures, so an uncaught error here would be a
+    # bare traceback that the caller could not attribute to anything.
+    with pytest.raises(SystemExit) as raised:
         pipe.main(
             [
                 "prepare-data",
@@ -1134,6 +1162,8 @@ def test_the_corpus_can_be_re_measured_without_re_running_the_chain(
                 str(tmp_path / "sft.jsonl"),
             ]
         )
+    assert raised.value.code == 2
+    assert "No data to train on" in capsys.readouterr().out
 
 
 def _tiny_corpus(path: pathlib.Path) -> pathlib.Path:
@@ -1462,9 +1492,34 @@ def test_a_failing_stage_becomes_the_process_exit_code(
     """
     stages = [Stage("boom", (sys.executable, "-c", "import sys; sys.exit(7)"))]
     monkeypatch.setattr(pipe, "build_stages", lambda options: stages)
+    # Its own log directory, because the default is the run directory the pipeline uses
+    # for real. Without this the test wrote a failure record into `runs/pipeline/`, and
+    # a later run -- failing for an unrelated reason -- reported this test's stage name.
     with pytest.raises(SystemExit) as raised:
-        pipe.main([])
+        pipe.main(["--log-root", str(tmp_path / "logs")])
     assert raised.value.code == 7, "the stage's code did not become the pipeline's"
+
+
+def test_a_failure_record_from_a_previous_run_is_not_reported_for_this_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The record has to mean "this run", or it is worse than no record.
+
+    Measured: a test wrote one into the real run directory, a later run failed for an
+    unrelated reason, and the notebook named a stage that does not exist in the plan.
+    A stale diagnosis sends the reader to the wrong place and does it confidently.
+    """
+    (tmp_path / "last_failure.json").write_text(
+        json.dumps({"stage": "boom", "exit_code": 7}), encoding="utf-8"
+    )
+    lines: list[str] = []
+    pipeline = Pipeline(
+        [Stage("ok", (sys.executable, "-c", "print('fine')"))],
+        emit=lines.append,
+        log_root=tmp_path,
+    )
+    assert pipeline.run() == 0
+    assert not (tmp_path / "last_failure.json").exists(), "the stale record survived a clean run"
 
 
 def test_a_stage_that_stops_without_a_pipe_says_so_rather_than_reporting_an_empty_log(
